@@ -3,7 +3,8 @@
 # Sends Telegram alerts when SMT divergence lines are drawn
 # Coins: BTC, ETH, SOL, BNB
 # Timeframes: 15m, 1H
-# Comparison: NQ1! and YM1! (from yfinance)
+# Comparison: NQ1! and YM1! (from stooq.com)
+# Crypto data: Binance public API
 # ============================================================
 
 import os
@@ -13,7 +14,7 @@ import threading
 import requests
 import pandas as pd
 import numpy as np
-import yfinance as yf
+from io import StringIO
 from datetime import datetime, timezone, timedelta
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -23,18 +24,18 @@ import telebot
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID        = os.environ.get('CHAT_ID',        '')
 
-# ── Coins to Monitor ────────────────────────────────────────
+# ── Coins to Monitor (Binance symbols) ──────────────────────
 COINS = {
-    'BTC':  'BTC-USD',
-    'ETH':  'ETH-USD',
-    'SOL':  'SOL-USD',
-    'BNB':  'BNB-USD',
+    'BTC':  'BTCUSDT',
+    'ETH':  'ETHUSDT',
+    'SOL':  'SOLUSDT',
+    'BNB':  'BNBUSDT',
 }
 
-# ── Comparison Symbols (yfinance tickers) ───────────────────
+# ── Comparison Symbols (stooq tickers) ──────────────────────
 COMP_SYMBOLS = {
-    'NQ1!': 'NQ=F',
-    'YM1!': 'YM=F',
+    'NQ1!': 'nq.f',   # Nasdaq 100 Futures continuous
+    'YM1!': 'ym.f',   # Dow Jones Futures continuous
 }
 
 # ── Timeframes ──────────────────────────────────────────────
@@ -43,10 +44,17 @@ TIMEFRAMES = {
     '1h':  '1h',
 }
 
-# yfinance period mapping (how much history to fetch)
-PERIOD_MAP = {
-    '15m': '5d',
-    '1h':  '30d',
+# ── Binance API ─────────────────────────────────────────────
+BINANCE_BASE = 'https://api.binance.com/api/v3'
+
+BINANCE_INTERVAL = {
+    '15m': '15m',
+    '1h':  '1h',
+}
+
+STOOQ_INTERVAL = {
+    '15m': '15',
+    '1h':  '60',
 }
 
 # ── TraderDiegoX Settings (matching script defaults) ────────
@@ -62,8 +70,8 @@ HIDE_INSIDE       = True
 COOLDOWN_SECONDS  = 30 * 60   # 30 minutes per direction per coin per TF
 
 # ── State ───────────────────────────────────────────────────
-last_alerts = {}  # key: coin_tf_direction, value: timestamp
-sent_signatures = set()  # unique signature per signal to prevent dupes
+last_alerts = {}      # key: cooldown_key, value: timestamp
+sent_signatures = set()  # unique signature per signal
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] %(message)s')
@@ -80,37 +88,68 @@ except Exception as e:
 
 
 # ============================================================
-# DATA FETCHING (yfinance)
+# DATA FETCHING — Binance for crypto, Stooq for futures
 # ============================================================
 
-def get_ohlc(ticker, interval):
-    """Fetch OHLC data from yfinance"""
+def get_ohlc_binance(symbol, interval):
+    """Fetch OHLC from Binance public API (for crypto)"""
     try:
-        period = PERIOD_MAP.get(interval, '5d')
-        df = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            progress=False,
-            auto_adjust=False,
+        binance_int = BINANCE_INTERVAL.get(interval, '15m')
+        resp = requests.get(
+            f"{BINANCE_BASE}/klines",
+            params={'symbol': symbol, 'interval': binance_int, 'limit': 500},
+            timeout=15
         )
+        if resp.status_code != 200:
+            logger.error(f"Binance HTTP {resp.status_code} for {symbol}")
+            return None
+        klines = resp.json()
+        if not klines or isinstance(klines, dict):
+            return None
+        df = pd.DataFrame(klines, columns=[
+            'time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'qav', 'num_trades', 'taker_base', 'taker_quote', 'ignore'
+        ])
+        df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+        return df[['time', 'open', 'high', 'low', 'close']]
+    except Exception as e:
+        logger.error(f"Binance OHLC error {symbol} {interval}: {e}")
+        return None
+
+
+def get_ohlc_stooq(symbol, interval):
+    """Fetch OHLC from stooq.com (for futures like NQ, YM)"""
+    try:
+        stooq_int = STOOQ_INTERVAL.get(interval, '15')
+        url = f"https://stooq.com/q/d/l/?s={symbol}&i={stooq_int}"
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200 or 'No data' in resp.text:
+            logger.error(f"Stooq HTTP {resp.status_code} for {symbol}")
+            return None
+        df = pd.read_csv(StringIO(resp.text))
         if df.empty:
             return None
-        # Flatten column names if MultiIndex
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.reset_index()
-        # Standardize column names
-        df.columns = [c.lower() if isinstance(c, str) else c for c in df.columns]
-        # Make sure index column has consistent name
-        if 'datetime' in df.columns:
-            df.rename(columns={'datetime': 'time'}, inplace=True)
-        elif 'date' in df.columns:
+        df.columns = [c.lower() for c in df.columns]
+        if 'date' in df.columns:
             df.rename(columns={'date': 'time'}, inplace=True)
-        return df
+        df['time'] = pd.to_datetime(df['time'], utc=True)
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = df[col].astype(float)
+        df = df.sort_values('time').reset_index(drop=True)
+        return df[['time', 'open', 'high', 'low', 'close']].tail(500)
     except Exception as e:
-        logger.error(f"OHLC error {ticker} {interval}: {e}")
+        logger.error(f"Stooq OHLC error {symbol} {interval}: {e}")
         return None
+
+
+def get_ohlc(ticker, interval):
+    """Smart router: Binance for crypto, stooq for futures"""
+    if ticker in COINS.values():
+        return get_ohlc_binance(ticker, interval)
+    else:
+        return get_ohlc_stooq(ticker, interval)
 
 
 # ============================================================
@@ -119,9 +158,8 @@ def get_ohlc(ticker, interval):
 
 def detect_pivots(values, left, right):
     """
-    Returns list of (bar_index, value, is_high) for confirmed pivots.
+    Returns (pivots_high, pivots_low) lists of (bar_index, value).
     Matches ta.pivothigh / ta.pivotlow exactly.
-    Pivot at bar i is confirmed at bar i+right.
     """
     pivots_high = []
     pivots_low  = []
@@ -153,8 +191,10 @@ def detect_pivots(values, left, right):
 def cross_ok(highs, lows, bar_a, px_a, bar_b, px_b, is_bear):
     """Check if line between two pivots was crossed by intermediate price"""
     span = bar_b - bar_a - 1
-    if span <= 0 or span > MAX_SIGNAL_SPAN:
-        return span <= MAX_SIGNAL_SPAN
+    if span <= 0:
+        return True
+    if span > MAX_SIGNAL_SPAN:
+        return False
     for d in range(1, span + 1):
         idx = bar_a + d
         if idx >= len(highs):
@@ -171,7 +211,7 @@ def cross_ok(highs, lows, bar_a, px_a, bar_b, px_b, is_bear):
 
 
 # ============================================================
-# FIND MATCHING PIVOT IN COMPARISON SYMBOL
+# FIND MATCHING PIVOTS IN COMPARISON SYMBOL
 # ============================================================
 
 def find_near_pivot(pivots, target_bar, tol):
@@ -207,14 +247,13 @@ def find_near_pivot_before(pivots, target_bar, limit_bar, tol):
 def detect_smt(coin_df, comp_df, comp_label):
     """
     Returns list of SMT signals on the LATEST bar of coin_df.
-    Each signal: dict with type, coin pivot info, comp pivot info.
     """
     if coin_df is None or comp_df is None:
         return []
     if len(coin_df) < 50 or len(comp_df) < 50:
         return []
 
-    # Align lengths (use min)
+    # Align lengths
     n = min(len(coin_df), len(comp_df))
     coin_df = coin_df.tail(n).reset_index(drop=True)
     comp_df = comp_df.tail(n).reset_index(drop=True)
@@ -228,14 +267,10 @@ def detect_smt(coin_df, comp_df, comp_label):
         'low':  comp_df['low'].values.astype(float),
     }
 
-    # Pivot B (current) uses lookback 1
     coin_b_highs, coin_b_lows = detect_pivots(coin_vals, PIVOT_LOOKBACK, PIVOT_LOOKBACK)
     comp_b_highs, comp_b_lows = detect_pivots(comp_vals, PIVOT_LOOKBACK, PIVOT_LOOKBACK)
-
-    # Pivot A (older) uses stricter strength
     coin_a_highs, coin_a_lows = detect_pivots(coin_vals, PIVOT_A_STRENGTH, PIVOT_A_STRENGTH)
 
-    # Latest confirmed bar (n - 1 - right offset)
     latest_bar = n - 1 - PIVOT_LOOKBACK
     signals = []
 
@@ -243,11 +278,9 @@ def detect_smt(coin_df, comp_df, comp_label):
     coin_latest_ph = next(((b, v) for b, v in coin_b_highs if b == latest_bar), None)
     if coin_latest_ph:
         bar_b, px_b = coin_latest_ph
-        # Find matching high in comparison
         comp_b_idx = find_near_pivot(comp_b_highs, bar_b, SYNC_TOL)
         if comp_b_idx >= 0:
             comp_bar_b, comp_px_b = comp_b_highs[comp_b_idx]
-            # Find best older pivot A on coin
             for j in range(len(coin_a_highs) - 1, -1, -1):
                 bar_a, px_a = coin_a_highs[j]
                 span = bar_b - bar_a
@@ -255,11 +288,9 @@ def detect_smt(coin_df, comp_df, comp_label):
                     continue
                 if span > MAX_SIGNAL_SPAN:
                     break
-                # Find matching pivot A on comparison
                 comp_a_idx = find_near_pivot_before(comp_b_highs, bar_a, comp_bar_b, SYNC_TOL)
                 if comp_a_idx >= 0:
                     comp_bar_a, comp_px_a = comp_b_highs[comp_a_idx]
-                    # SMT: coin made HH, comp made LH (or didn't follow)
                     coin_higher_high = px_b > px_a
                     comp_diverged    = comp_px_b < comp_px_a
                     if coin_higher_high and comp_diverged:
@@ -363,6 +394,9 @@ def send_startup_msg():
         f"<b>Coins:</b> {coins_str}\n"
         f"<b>Timeframes:</b> {tfs_str}\n"
         f"<b>Comparisons:</b> {comps_str}\n\n"
+        f"<b>Data Sources:</b>\n"
+        f"  Crypto: Binance API\n"
+        f"  Futures: stooq.com\n\n"
         f"<b>Settings:</b>\n"
         f"  Pivot Lookback: {PIVOT_LOOKBACK}\n"
         f"  Pivot A Strength: {PIVOT_A_STRENGTH}\n"
@@ -392,7 +426,6 @@ def scan_coin_tf(coin_name, coin_ticker, tf_label, tf_interval):
 
             signals = detect_smt(coin_df, comp_df, comp_label)
             for sig in signals:
-                # Unique signature
                 signature = (
                     f"{coin_name}_{tf_label}_{sig['direction']}_"
                     f"{sig['comp_label']}_"
@@ -402,13 +435,11 @@ def scan_coin_tf(coin_name, coin_ticker, tf_label, tf_interval):
                 if signature in sent_signatures:
                     continue
 
-                # Cooldown check
                 cooldown_key = f"{coin_name}_{tf_label}_{sig['direction']}_{sig['comp_label']}"
                 last_time = last_alerts.get(cooldown_key, 0)
                 if time.time() - last_time < COOLDOWN_SECONDS:
                     continue
 
-                # Send alert
                 msg = format_signal(coin_name, tf_label, sig)
                 send_msg(msg)
                 sent_signatures.add(signature)
@@ -418,7 +449,6 @@ def scan_coin_tf(coin_name, coin_ticker, tf_label, tf_interval):
                     f"@ {sig['coin_px_b']:.4f}"
                 )
 
-        # Memory cleanup
         if len(sent_signatures) > 2000:
             for s in list(sent_signatures)[:1000]:
                 sent_signatures.discard(s)
@@ -454,6 +484,8 @@ def index():
         f"<p><b>Time UTC:</b> {now.strftime('%Y-%m-%d %H:%M:%S')}</p>"
         f"<p><b>Comparisons:</b> NQ1!, YM1!</p>"
         f"<p><b>Timeframes:</b> 15m, 1H</p>"
+        f"<p><b>Crypto data:</b> Binance API</p>"
+        f"<p><b>Futures data:</b> stooq.com</p>"
         f"<p><b>Total alerts sent:</b> {len(sent_signatures)}</p>"
         f"<p><b>Active cooldowns:</b> {len(last_alerts)}</p>"
         f"<h3>Monitoring:</h3><ul>{coins_html}</ul>"
