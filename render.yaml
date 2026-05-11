@@ -1,1 +1,6 @@
-
+services:
+  - type: web
+    name: smt-alert-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:10000 --workers 1 --timeout 120
