@@ -31,16 +31,16 @@ COINS = {
 
 # ── Dominance basket (circulating supplies — May 2025) ───────
 DOMINANCE_BASKET = {
-    'BTCUSDT':  19_700_000,
-    'ETHUSDT':  120_270_000,
-    'BNBUSDT':  140_890_000,
-    'SOLUSDT':  465_000_000,
-    'XRPUSDT':  57_800_000_000,
-    'ADAUSDT':  35_600_000_000,
-    'AVAXUSDT': 410_000_000,
-    'DOGEUSDT': 146_000_000_000,
-    'MATICUSDT':9_900_000_000,
-    'DOTUSDT':  1_430_000_000,
+    'BTCUSDT':   19_700_000,
+    'ETHUSDT':   120_270_000,
+    'BNBUSDT':   140_890_000,
+    'SOLUSDT':   465_000_000,
+    'XRPUSDT':   57_800_000_000,
+    'ADAUSDT':   35_600_000_000,
+    'AVAXUSDT':  410_000_000,
+    'DOGEUSDT':  146_000_000_000,
+    'MATICUSDT': 9_900_000_000,
+    'DOTUSDT':   1_430_000_000,
 }
 
 COMP_LABEL = 'BTC.D'
@@ -63,13 +63,14 @@ MAX_SIGNAL_SPAN  = 180
 CROSS_TOL_PCT    = 0.02
 
 # ── Timing ───────────────────────────────────────────────────
-COOLDOWN_SECONDS     = 30 * 60   # 30 min alert cooldown
-BTCD_REFRESH_MINUTES = 15        # refresh BTC.D every 15 min
+COOLDOWN_SECONDS     = 30 * 60
+BTCD_REFRESH_MINUTES = 15
 
 # ── BTC.D Cache ──────────────────────────────────────────────
-BTCD_CACHE:    dict = {}          # tf -> DataFrame
-BTCD_CACHE_TS: dict = {}          # tf -> epoch float
-BTCD_LOCK = threading.Lock()
+BTCD_CACHE:    dict = {}
+BTCD_CACHE_TS: dict = {}
+BTCD_LOCK    = threading.Lock()
+BTCD_READY   = threading.Event()   # ← signals when BOTH tfs loaded
 
 # ── Alert state ──────────────────────────────────────────────
 last_alerts     = {}
@@ -97,7 +98,6 @@ except Exception as e:
 
 def fetch_klines(symbol: str, interval: str,
                  limit: int = 500) -> pd.DataFrame | None:
-    """Fetch OHLC candles from Binance.US."""
     try:
         resp = requests.get(
             f"{BINANCE_US_BASE}/klines",
@@ -139,21 +139,11 @@ def fetch_klines(symbol: str, interval: str,
 # ============================================================
 
 def build_btcd_ohlc(interval: str) -> pd.DataFrame | None:
-    """
-    Build synthetic BTC Dominance OHLC from Binance.US prices.
-
-    Formula per candle:
-        total_mcap  = sum(price[symbol] × supply[symbol])
-        btc_dom     = btc_price × btc_supply / total_mcap × 100
-
-    OHLC shape follows BTC's own candle scaled by dominance ratio.
-    Uses only Binance.US — zero external API calls.
-    """
     try:
         bin_interval = BINANCE_INTERVAL.get(interval, '15m')
 
-        # ── Fetch all basket symbols ──────────────────────────
-        price_data: dict[str, pd.DataFrame] = {}
+        # Fetch all basket symbols
+        price_data: dict = {}
         for symbol in DOMINANCE_BASKET:
             df = fetch_klines(symbol, bin_interval, limit=500)
             if df is not None:
@@ -162,25 +152,23 @@ def build_btcd_ohlc(interval: str) -> pd.DataFrame | None:
                 logger.warning(
                     f"BTC.D basket: could not fetch {symbol} — skipping"
                 )
-            time.sleep(0.2)   # gentle pacing between requests
+            time.sleep(0.2)
 
-        # ── Validate minimum basket ───────────────────────────
         if 'BTCUSDT' not in price_data:
             logger.error("BTCUSDT missing — cannot compute BTC.D")
             return None
 
         if len(price_data) < 3:
             logger.error(
-                f"Only {len(price_data)} basket symbols fetched — aborting"
+                f"Only {len(price_data)} basket symbols — aborting"
             )
             return None
 
-        # ── Build BTC.D candle by candle ─────────────────────
+        # Build candle-by-candle
         btc_df  = price_data['BTCUSDT']
         records = []
 
         for ts in btc_df.index:
-            # Sum market caps at this timestamp using close price
             total_mcap = 0.0
             for symbol, supply in DOMINANCE_BASKET.items():
                 sym_df = price_data.get(symbol)
@@ -191,8 +179,6 @@ def build_btcd_ohlc(interval: str) -> pd.DataFrame | None:
                 continue
 
             btc_supply = DOMINANCE_BASKET['BTCUSDT']
-
-            # Scale BTC's OHLC candle shape into dominance %
             records.append({
                 'time':  ts,
                 'open':  (btc_df.loc[ts, 'open']  * btc_supply / total_mcap) * 100.0,
@@ -203,7 +189,7 @@ def build_btcd_ohlc(interval: str) -> pd.DataFrame | None:
 
         if len(records) < 20:
             logger.error(
-                f"BTC.D {interval}: only {len(records)} candles — insufficient"
+                f"BTC.D {interval}: only {len(records)} candles"
             )
             return None
 
@@ -227,32 +213,41 @@ def build_btcd_ohlc(interval: str) -> pd.DataFrame | None:
 
 def refresh_btcd_cache():
     """
-    Rebuild BTC.D OHLC for all timeframes and update cache.
-    Called by scheduler every 15 min — NOT by the scan loop.
+    Rebuild BTC.D for all timeframes.
+    Sets BTCD_READY event once both timeframes are loaded.
     """
     logger.info("BTC.D cache refresh starting…")
+    loaded = 0
+
     for tf in ['15m', '1h']:
         df = build_btcd_ohlc(tf)
         with BTCD_LOCK:
             if df is not None:
                 BTCD_CACHE[tf]    = df
                 BTCD_CACHE_TS[tf] = time.time()
+                loaded += 1
             else:
                 if tf in BTCD_CACHE:
                     logger.warning(
-                        f"BTC.D {tf} refresh failed — keeping stale cache"
+                        f"BTC.D {tf} failed — keeping stale cache"
                     )
+                    loaded += 1   # stale is still usable
                 else:
                     logger.warning(
-                        f"BTC.D {tf} refresh failed — no data available"
+                        f"BTC.D {tf} failed — no data available yet"
                     )
         if tf == '15m':
-            time.sleep(2)   # small gap between the two timeframe builds
+            time.sleep(2)
+
+    # Signal that cache is ready for scanning
+    if loaded == len(TIMEFRAMES) and not BTCD_READY.is_set():
+        BTCD_READY.set()
+        logger.info("✅ BTC.D ready — scan loop unblocked")
+
     logger.info("BTC.D cache refresh complete")
 
 
 def get_btcd(tf: str) -> pd.DataFrame | None:
-    """Thread-safe read from BTC.D cache."""
     with BTCD_LOCK:
         return BTCD_CACHE.get(tf)
 
@@ -342,7 +337,7 @@ def detect_smt(coin_df: pd.DataFrame,
     latest  = n - 1 - PIVOT_LOOKBACK
     signals = []
 
-    # ── BEAR: coin Higher High + BTC.D Lower High ────────────
+    # ── BEAR ─────────────────────────────────────────────────
     cph = next(((b, v) for b, v in cb_hi if b == latest), None)
     if cph:
         bar_b, px_b = cph
@@ -381,7 +376,7 @@ def detect_smt(coin_df: pd.DataFrame,
                             })
                             break
 
-    # ── BULL: coin Lower Low + BTC.D Higher Low ──────────────
+    # ── BULL ─────────────────────────────────────────────────
     cpl = next(((b, v) for b, v in cb_lo if b == latest), None)
     if cpl:
         bar_b, px_b = cpl
@@ -487,10 +482,10 @@ def send_startup_msg():
         f"<b>SMT Logic:</b>\n"
         f"  🟢 BULL = Coin Lower Low   + BTC.D Higher Low\n"
         f"  🔴 BEAR = Coin Higher High + BTC.D Lower High\n\n"
-        f"<b>Scan:</b>         Every 5 minutes\n"
+        f"<b>Scan:</b>          Every 5 minutes\n"
         f"<b>BTC.D refresh:</b> Every 15 minutes\n"
         f"<b>Alert cooldown:</b> 30 minutes\n\n"
-        f"<i>Bot is live and scanning…</i>"
+        f"<i>Building BTC.D cache — first scan starts shortly…</i>"
     )
 
 
@@ -499,23 +494,35 @@ def send_startup_msg():
 # ============================================================
 
 def scan_all():
+    """
+    Main scan function.
+    Waits for BTCD_READY before running — prevents the race
+    condition where scan fires before BTC.D cache is built.
+    """
     try:
+        # Block until BTC.D is ready (max 120s wait)
+        if not BTCD_READY.is_set():
+            logger.info("Scan waiting for BTC.D cache to be ready…")
+            BTCD_READY.wait(timeout=120)
+            if not BTCD_READY.is_set():
+                logger.error(
+                    "BTC.D cache not ready after 120s — skipping scan"
+                )
+                return
+
         now = datetime.now(timezone.utc)
         logger.info(f"🔍 Scan at {now.strftime('%H:%M:%S UTC')}")
 
         for coin_name, coin_ticker in COINS.items():
             for tf_label, tf_interval in TIMEFRAMES.items():
 
-                # Read BTC.D from cache — never fetches here
                 comp_df = get_btcd(tf_label)
                 if comp_df is None:
                     logger.warning(
-                        f"BTC.D not ready for {tf_label} — "
-                        f"skipping {coin_name}"
+                        f"BTC.D {tf_label} missing — skipping {coin_name}"
                     )
                     continue
 
-                # Fetch coin OHLC from Binance.US
                 coin_df = fetch_klines(
                     coin_ticker,
                     BINANCE_INTERVAL[tf_interval],
@@ -523,14 +530,11 @@ def scan_all():
                 )
                 if coin_df is None:
                     logger.warning(
-                        f"No Binance data for {coin_name} {tf_label}"
+                        f"No Binance data: {coin_name} {tf_label}"
                     )
                     continue
 
-                # Run SMT detection
                 for sig in detect_smt(coin_df, comp_df, COMP_LABEL):
-
-                    # Deduplication key
                     sig_key = (
                         f"{coin_name}_{tf_label}_{sig['direction']}_"
                         f"{sig['coin_bar_a']}_{sig['coin_bar_b']}_"
@@ -540,14 +544,12 @@ def scan_all():
                     if sig_key in sent_signatures:
                         continue
 
-                    # Cooldown check
                     ck = (f"{coin_name}_{tf_label}_"
                           f"{sig['direction']}_BTCD")
                     if (time.time() - last_alerts.get(ck, 0)
                             < COOLDOWN_SECONDS):
                         continue
 
-                    # Send alert
                     send_msg(format_signal(coin_name, tf_label, sig))
                     sent_signatures.add(sig_key)
                     last_alerts[ck] = time.time()
@@ -558,9 +560,8 @@ def scan_all():
                         f"btcd={sig['comp_px_b']:.3f}%"
                     )
 
-                time.sleep(0.2)   # pace Binance calls
+                time.sleep(0.2)
 
-        # Trim old signatures
         if len(sent_signatures) > 2000:
             for s in list(sent_signatures)[:1000]:
                 sent_signatures.discard(s)
@@ -596,7 +597,8 @@ def index():
                 f"<li><b>{tf}</b>: "
                 f"building… (first load ~30s)</li>"
             )
-    coins_html  = ''.join(f"<li>{c}/USDT</li>" for c in COINS)
+    ready_str  = '✅ Ready' if BTCD_READY.is_set() else '⏳ Building…'
+    coins_html = ''.join(f"<li>{c}/USDT</li>" for c in COINS)
     basket_html = ''.join(
         f"<li>{s.replace('USDT', '')}</li>"
         for s in DOMINANCE_BASKET
@@ -604,6 +606,7 @@ def index():
     return (
         f"<h2>🤖 SMT Alert Bot</h2>"
         f"<p><b>Status:</b> ✅ Running</p>"
+        f"<p><b>BTC.D Cache:</b> {ready_str}</p>"
         f"<p><b>Time UTC:</b> {now.strftime('%Y-%m-%d %H:%M:%S')}</p>"
         f"<p><b>Data source:</b> Binance.US only</p>"
         f"<p><b>Scan:</b> every 5 min | "
@@ -639,6 +642,7 @@ def status():
         }
     return {
         'status':      'running',
+        'btcd_ready':  BTCD_READY.is_set(),
         'time_utc':    datetime.now(timezone.utc).isoformat(),
         'alerts_sent': len(sent_signatures),
         'cooldowns':   len(last_alerts),
@@ -684,6 +688,7 @@ def refresh_btcd_route():
 def reset():
     sent_signatures.clear()
     last_alerts.clear()
+    BTCD_READY.clear()
     with BTCD_LOCK:
         BTCD_CACHE.clear()
         BTCD_CACHE_TS.clear()
@@ -702,14 +707,14 @@ def start_bot():
     except Exception as e:
         logger.error(f"Startup msg error: {e}")
 
-    # Build BTC.D cache immediately in background
+    # Build BTC.D cache first — scan won't run until this completes
     threading.Thread(
         target=refresh_btcd_cache, daemon=True
     ).start()
 
     scheduler = BackgroundScheduler(timezone='UTC')
 
-    # ── Scan every 5 minutes ─────────────────────────────────
+    # Scan every 5 minutes — sufficient for 15m and 1H candles
     scheduler.add_job(
         scan_all,
         trigger='cron',
@@ -720,7 +725,7 @@ def start_bot():
         misfire_grace_time=30,
     )
 
-    # ── Refresh BTC.D every 15 minutes ───────────────────────
+    # Refresh BTC.D every 15 minutes
     scheduler.add_job(
         refresh_btcd_cache,
         trigger='cron',
