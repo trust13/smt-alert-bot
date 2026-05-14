@@ -1,8 +1,12 @@
 # ============================================================
-# ORDER BLOCK ALERT BOT — STRICT MODE + LATE PRE-ALERTS
+# ORDER BLOCK ALERT BOT — LIFECYCLE MODE
 # Coins: BTC, ETH, SOL  |  Timeframes: 15m, 1H
-# Pre-alerts only fire LATE in candle (15m: min 8+, 1H: min 40+)
-# Confirmed alerts only for OBs within last 3 candles
+#
+# Three alert states:
+#   🟡 PRE-ALERT  → OB candidate detected (fractal + OB + FVG)
+#   🟢 CONFIRMED  → candle closes beyond fractal in OB direction
+#   ❌ FAILED     → candle closes outside OB zone (opposite direction)
+#
 # Data: Binance.US (no external APIs, no API keys)
 # Scan: Every 1 minute
 # ============================================================
@@ -22,24 +26,21 @@ import telebot
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID        = os.environ.get('CHAT_ID', '')
 
-# ── Coins ────────────────────────────────────────────────────
+# ── Coins & Timeframes ───────────────────────────────────────
 COINS = {
     'BTC': 'BTCUSDT',
     'ETH': 'ETHUSDT',
     'SOL': 'SOLUSDT',
 }
-
-# ── Timeframes ───────────────────────────────────────────────
 TIMEFRAMES = {
     '15m': '15m',
     '1h':  '1h',
 }
 
-# ── API ──────────────────────────────────────────────────────
 BINANCE_US_BASE  = 'https://api.binance.us/api/v3'
 BINANCE_INTERVAL = {'15m': '15m', '1h': '1h'}
 
-# ── OB Detection Settings ────────────────────────────────────
+# ── OB Settings ──────────────────────────────────────────────
 FRACTAL_TYPE        = 3
 REQUIRE_FVG         = True
 MAX_OB_TO_FVG_BARS  = 3
@@ -48,25 +49,10 @@ SKIP_OVERLAP        = True
 OVERLAP_WINDOW      = 20
 FRESH_ONLY          = True
 
-# ── Strict Freshness ─────────────────────────────────────────
-MAX_BREAK_AGE_BARS  = 3
-
-# ── Pre-Alert Timing ─────────────────────────────────────────
-# Only fire pre-alerts after the candle has been forming for
-# at least this many minutes. Prevents early-candle false signals.
-PREALERT_MIN_AGE_MINUTES = {
-    '15m': 8,    # Pre-alert allowed from minute 8 onwards (8-15 in)
-    '1h':  40,   # Pre-alert allowed from minute 40 onwards (40-60 in)
-}
-
-# ── Cooldown ─────────────────────────────────────────────────
-COOLDOWN_SECONDS    = 30 * 60
-MAX_OBS_PER_COIN    = 3
-
-# ── Alert state ──────────────────────────────────────────────
-last_alerts          = {}
-sent_signatures      = set()
-prealert_signatures  = set()
+# ── Strict freshness — only alert OBs from recent bars ───────
+# Pre-alerts: only consider OB candidates whose fractal is within last N bars
+# Confirmed/failed: only react to the just-closed candle
+MAX_PREALERT_AGE_BARS = 10   # ignore OB candidates older than 10 bars
 
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -85,11 +71,31 @@ except Exception as e:
 
 
 # ============================================================
+# PERSISTENT PENDING OB STATE
+# Each pending OB has a unique key: coin_tf_type_fractalTime
+# Lifecycle:
+#   - Detected → added to pending_obs, pre-alert sent
+#   - Each scan: check confirmation or failure
+#   - On confirmation: removed + confirmed alert
+#   - On failure: removed + failed alert
+# ============================================================
+
+# pending_obs[key] = {
+#   'coin': str, 'tf': str, 'type': 'BULL'/'BEAR',
+#   'fractal_level': float, 'fractal_time': pd.Timestamp,
+#   'ob_top': float, 'ob_bot': float,
+#   'ob_time': pd.Timestamp,
+#   'detected_at': float (epoch),
+# }
+pending_obs = {}
+pending_lock = threading.Lock()
+
+
+# ============================================================
 # BINANCE.US DATA
 # ============================================================
 
-def fetch_klines(symbol: str, interval: str,
-                 limit: int = 500) -> pd.DataFrame | None:
+def fetch_klines(symbol, interval, limit=500):
     try:
         resp = requests.get(
             f"{BINANCE_US_BASE}/klines",
@@ -118,29 +124,10 @@ def fetch_klines(symbol: str, interval: str,
 
 
 # ============================================================
-# CANDLE AGE HELPER
-# ============================================================
-
-def is_candle_old_enough(df: pd.DataFrame, tf_label: str) -> tuple[bool, int]:
-    """
-    Returns (is_old_enough, current_age_minutes).
-    Pre-alerts only fire after the live candle has aged enough.
-    """
-    if len(df) < 1:
-        return False, 0
-    live_open_time = df['time'].iloc[-1]
-    now_utc = datetime.now(timezone.utc)
-    age_seconds = (now_utc - live_open_time.to_pydatetime()).total_seconds()
-    age_minutes = int(age_seconds // 60)
-    min_age = PREALERT_MIN_AGE_MINUTES.get(tf_label, 0)
-    return (age_minutes >= min_age, age_minutes)
-
-
-# ============================================================
 # FRACTAL DETECTION
 # ============================================================
 
-def is_fractal_high(highs, idx: int, side: int) -> bool:
+def is_fractal_high(highs, idx, side):
     n = len(highs)
     if idx - side < 0 or idx + side >= n: return False
     pivot = highs[idx]
@@ -150,7 +137,7 @@ def is_fractal_high(highs, idx: int, side: int) -> bool:
     return True
 
 
-def is_fractal_low(lows, idx: int, side: int) -> bool:
+def is_fractal_low(lows, idx, side):
     n = len(lows)
     if idx - side < 0 or idx + side >= n: return False
     pivot = lows[idx]
@@ -164,41 +151,41 @@ def is_fractal_low(lows, idx: int, side: int) -> bool:
 # FVG DETECTION
 # ============================================================
 
-def has_bullish_fvg_after(highs, lows, ob_idx, max_bars, n) -> int:
+def has_bullish_fvg_after(highs, lows, ob_idx, max_bars, n):
     end = min(n - 2, ob_idx + max_bars)
     for i in range(ob_idx, end + 1):
         if i + 2 >= n: break
         if lows[i + 2] > highs[i]:
-            return i + 1
-    return -1
+            return True
+    return False
 
 
-def has_bearish_fvg_after(highs, lows, ob_idx, max_bars, n) -> int:
+def has_bearish_fvg_after(highs, lows, ob_idx, max_bars, n):
     end = min(n - 2, ob_idx + max_bars)
     for i in range(ob_idx, end + 1):
         if i + 2 >= n: break
         if highs[i + 2] < lows[i]:
-            return i + 1
-    return -1
+            return True
+    return False
 
-
-# ============================================================
-# OB DETECTION
-# ============================================================
 
 def is_bullish(o, c): return c > o
 def is_bearish(o, c): return c < o
 
 
-def detect_obs(df: pd.DataFrame) -> tuple[list, list]:
+# ============================================================
+# DETECT NEW PENDING OBs FROM JUST-CONFIRMED FRACTALS
+# ============================================================
+
+def detect_new_pending(df, coin, tf):
     """
-    Returns (confirmed_obs, prealert_obs)
-    Process bars chronologically like Pine Script.
+    Look for fractals that JUST got confirmed (right-side bar = last closed).
+    For each, find the OB candidate. If valid, add to pending state.
     """
     n = len(df)
     side = 1 if FRACTAL_TYPE == 3 else 2
     if n < (side * 2 + 10):
-        return [], []
+        return []
 
     opens  = df['open'].values
     highs  = df['high'].values
@@ -206,240 +193,173 @@ def detect_obs(df: pd.DataFrame) -> tuple[list, list]:
     closes = df['close'].values
     times  = df['time'].values
 
-    live_idx        = n - 1
     last_closed_idx = n - 2
+    new_pending = []
 
-    confirmed_obs = []
-    prealert_obs  = []
-    placed_bull_obs = []
-    placed_bear_obs = []
-
-    def overlaps_bull(top, bot, current_bar):
-        if not SKIP_OVERLAP: return False
-        for (t, b, idx) in placed_bull_obs:
-            if current_bar - idx > OVERLAP_WINDOW: continue
-            if not (bot > t or top < b):
-                return True
-        return False
-
-    def overlaps_bear(top, bot, current_bar):
-        if not SKIP_OVERLAP: return False
-        for (t, b, idx) in placed_bear_obs:
-            if current_bar - idx > OVERLAP_WINDOW: continue
-            if not (bot > t or top < b):
-                return True
-        return False
-
-    def is_bull_fresh(ob_bar, top, bot, until_bar):
-        if not FRESH_ONLY: return True
-        for k in range(ob_bar + 1, until_bar):
-            if closes[k] < bot:
-                return False
-        return True
-
-    def is_bear_fresh(ob_bar, top, bot, until_bar):
-        if not FRESH_ONLY: return True
-        for k in range(ob_bar + 1, until_bar):
-            if closes[k] > top:
-                return False
-        return True
-
-    active_fractal_high = None
-    active_fractal_low  = None
-
-    for i in range(side, last_closed_idx + 1):
-        if i + side > last_closed_idx:
-            break
-
-        if is_fractal_high(highs, i, side):
-            active_fractal_high = (i, highs[i])
-
-        if is_fractal_low(lows, i, side):
-            active_fractal_low = (i, lows[i])
-
-        check_bar = i + side
-        if check_bar > last_closed_idx:
+    # Check fractals within the last MAX_PREALERT_AGE_BARS bars
+    for f_idx in range(max(side, last_closed_idx - MAX_PREALERT_AGE_BARS),
+                       last_closed_idx - side + 1):
+        # The right-side neighbor is at f_idx + side; must be ≤ last_closed_idx
+        if f_idx + side > last_closed_idx:
             continue
 
-        # BULLISH BREAK
-        if active_fractal_high is not None:
-            f_idx, f_level = active_fractal_high
-            if check_bar > f_idx + side and closes[check_bar] > f_level:
-                ob_idx = -1
-                search_start = max(0, check_bar - OB_SEARCH_LOOKBACK)
-                for k in range(check_bar - 1, search_start - 1, -1):
-                    if is_bearish(opens[k], closes[k]):
-                        ob_idx = k
-                        break
+        # ── Bullish OB candidate (after fractal high) ─────
+        if is_fractal_high(highs, f_idx, side):
+            f_level = highs[f_idx]
+            f_time  = times[f_idx]
 
-                if ob_idx >= 0:
-                    fvg_ok = True
-                    if REQUIRE_FVG:
-                        fvg_ok = has_bullish_fvg_after(
-                            highs, lows, ob_idx, MAX_OB_TO_FVG_BARS, n
-                        ) >= 0
-
-                    top_lvl = opens[ob_idx]
-                    bot_lvl = lows[ob_idx]
-
-                    if (fvg_ok
-                            and not overlaps_bull(top_lvl, bot_lvl, ob_idx)
-                            and is_bull_fresh(ob_idx, top_lvl, bot_lvl, check_bar)):
-                        placed_bull_obs.append((top_lvl, bot_lvl, ob_idx))
-                        confirmed_obs.append({
-                            'type':         'BULL',
-                            'stage':        'CONFIRMED',
-                            'ob_idx':       ob_idx,
-                            'fractal_idx':  f_idx,
-                            'fractal_level':f_level,
-                            'break_idx':    check_bar,
-                            'break_close':  closes[check_bar],
-                            'ob_open':      opens[ob_idx],
-                            'ob_high':      highs[ob_idx],
-                            'ob_low':       lows[ob_idx],
-                            'ob_close':     closes[ob_idx],
-                            'ob_time':      times[ob_idx],
-                            'break_time':   times[check_bar],
-                            'top_level':    top_lvl,
-                            'bot_level':    bot_lvl,
-                            'break_age':    last_closed_idx - check_bar,
-                        })
-                active_fractal_high = None
-
-        # BEARISH BREAK
-        if active_fractal_low is not None:
-            f_idx, f_level = active_fractal_low
-            if check_bar > f_idx + side and closes[check_bar] < f_level:
-                ob_idx = -1
-                search_start = max(0, check_bar - OB_SEARCH_LOOKBACK)
-                for k in range(check_bar - 1, search_start - 1, -1):
-                    if is_bullish(opens[k], closes[k]):
-                        ob_idx = k
-                        break
-
-                if ob_idx >= 0:
-                    fvg_ok = True
-                    if REQUIRE_FVG:
-                        fvg_ok = has_bearish_fvg_after(
-                            highs, lows, ob_idx, MAX_OB_TO_FVG_BARS, n
-                        ) >= 0
-
-                    top_lvl = highs[ob_idx]
-                    bot_lvl = opens[ob_idx]
-
-                    if (fvg_ok
-                            and not overlaps_bear(top_lvl, bot_lvl, ob_idx)
-                            and is_bear_fresh(ob_idx, top_lvl, bot_lvl, check_bar)):
-                        placed_bear_obs.append((top_lvl, bot_lvl, ob_idx))
-                        confirmed_obs.append({
-                            'type':         'BEAR',
-                            'stage':        'CONFIRMED',
-                            'ob_idx':       ob_idx,
-                            'fractal_idx':  f_idx,
-                            'fractal_level':f_level,
-                            'break_idx':    check_bar,
-                            'break_close':  closes[check_bar],
-                            'ob_open':      opens[ob_idx],
-                            'ob_high':      highs[ob_idx],
-                            'ob_low':       lows[ob_idx],
-                            'ob_close':     closes[ob_idx],
-                            'ob_time':      times[ob_idx],
-                            'break_time':   times[check_bar],
-                            'top_level':    top_lvl,
-                            'bot_level':    bot_lvl,
-                            'break_age':    last_closed_idx - check_bar,
-                        })
-                active_fractal_low = None
-
-    # PRE-ALERTS on live candle
-    live_close = closes[live_idx]
-    live_time  = times[live_idx]
-
-    if active_fractal_high is not None:
-        f_idx, f_level = active_fractal_high
-        if live_idx > f_idx + side and live_close > f_level:
+            # Look back for last RED candle = OB
             ob_idx = -1
-            search_start = max(0, live_idx - OB_SEARCH_LOOKBACK)
-            for k in range(live_idx - 1, search_start - 1, -1):
+            for k in range(f_idx - 1, max(0, f_idx - 1 - OB_SEARCH_LOOKBACK), -1):
                 if is_bearish(opens[k], closes[k]):
                     ob_idx = k
                     break
+
             if ob_idx >= 0:
+                # Validate FVG
                 fvg_ok = True
                 if REQUIRE_FVG:
                     fvg_ok = has_bullish_fvg_after(
                         highs, lows, ob_idx, MAX_OB_TO_FVG_BARS, n
-                    ) >= 0
-                top_lvl = opens[ob_idx]
-                bot_lvl = lows[ob_idx]
-                if (fvg_ok
-                        and not overlaps_bull(top_lvl, bot_lvl, ob_idx)
-                        and is_bull_fresh(ob_idx, top_lvl, bot_lvl, live_idx)):
-                    prealert_obs.append({
-                        'type':         'BULL',
-                        'stage':        'PREALERT',
-                        'ob_idx':       ob_idx,
-                        'fractal_idx':  f_idx,
-                        'fractal_level':f_level,
-                        'live_close':   live_close,
-                        'live_time':    live_time,
-                        'ob_open':      opens[ob_idx],
-                        'ob_high':      highs[ob_idx],
-                        'ob_low':       lows[ob_idx],
-                        'ob_time':      times[ob_idx],
-                        'top_level':    top_lvl,
-                        'bot_level':    bot_lvl,
+                    )
+
+                ob_top = opens[ob_idx]
+                ob_bot = lows[ob_idx]
+
+                # Fresh check
+                fresh = True
+                if FRESH_ONLY:
+                    for k in range(ob_idx + 1, last_closed_idx + 1):
+                        if closes[k] < ob_bot:
+                            fresh = False
+                            break
+
+                if fvg_ok and fresh:
+                    key = f"{coin}_{tf}_BULL_{pd.Timestamp(f_time).isoformat()}"
+                    new_pending.append({
+                        'key':           key,
+                        'coin':          coin,
+                        'tf':            tf,
+                        'type':          'BULL',
+                        'fractal_level': f_level,
+                        'fractal_time':  f_time,
+                        'ob_top':        ob_top,
+                        'ob_bot':        ob_bot,
+                        'ob_time':       times[ob_idx],
                     })
 
-    if active_fractal_low is not None:
-        f_idx, f_level = active_fractal_low
-        if live_idx > f_idx + side and live_close < f_level:
+        # ── Bearish OB candidate (after fractal low) ──────
+        if is_fractal_low(lows, f_idx, side):
+            f_level = lows[f_idx]
+            f_time  = times[f_idx]
+
             ob_idx = -1
-            search_start = max(0, live_idx - OB_SEARCH_LOOKBACK)
-            for k in range(live_idx - 1, search_start - 1, -1):
+            for k in range(f_idx - 1, max(0, f_idx - 1 - OB_SEARCH_LOOKBACK), -1):
                 if is_bullish(opens[k], closes[k]):
                     ob_idx = k
                     break
+
             if ob_idx >= 0:
                 fvg_ok = True
                 if REQUIRE_FVG:
                     fvg_ok = has_bearish_fvg_after(
                         highs, lows, ob_idx, MAX_OB_TO_FVG_BARS, n
-                    ) >= 0
-                top_lvl = highs[ob_idx]
-                bot_lvl = opens[ob_idx]
-                if (fvg_ok
-                        and not overlaps_bear(top_lvl, bot_lvl, ob_idx)
-                        and is_bear_fresh(ob_idx, top_lvl, bot_lvl, live_idx)):
-                    prealert_obs.append({
-                        'type':         'BEAR',
-                        'stage':        'PREALERT',
-                        'ob_idx':       ob_idx,
-                        'fractal_idx':  f_idx,
-                        'fractal_level':f_level,
-                        'live_close':   live_close,
-                        'live_time':    live_time,
-                        'ob_open':      opens[ob_idx],
-                        'ob_high':      highs[ob_idx],
-                        'ob_low':       lows[ob_idx],
-                        'ob_time':      times[ob_idx],
-                        'top_level':    top_lvl,
-                        'bot_level':    bot_lvl,
+                    )
+
+                ob_top = highs[ob_idx]
+                ob_bot = opens[ob_idx]
+
+                fresh = True
+                if FRESH_ONLY:
+                    for k in range(ob_idx + 1, last_closed_idx + 1):
+                        if closes[k] > ob_top:
+                            fresh = False
+                            break
+
+                if fvg_ok and fresh:
+                    key = f"{coin}_{tf}_BEAR_{pd.Timestamp(f_time).isoformat()}"
+                    new_pending.append({
+                        'key':           key,
+                        'coin':          coin,
+                        'tf':            tf,
+                        'type':          'BEAR',
+                        'fractal_level': f_level,
+                        'fractal_time':  f_time,
+                        'ob_top':        ob_top,
+                        'ob_bot':        ob_bot,
+                        'ob_time':       times[ob_idx],
                     })
 
-    fresh_confirmed = [
-        ob for ob in confirmed_obs
-        if ob['break_age'] <= MAX_BREAK_AGE_BARS
-    ]
+    return new_pending
 
-    return fresh_confirmed, prealert_obs
+
+# ============================================================
+# CHECK PENDING OBs FOR CONFIRMATION OR FAILURE
+# Uses just-closed candle's CLOSE price
+# ============================================================
+
+def check_pending_status(coin, tf, df):
+    """
+    Returns (confirmed_list, failed_list) based on just-closed candle.
+    Removes confirmed/failed OBs from pending_obs.
+    """
+    if df is None or len(df) < 2:
+        return [], []
+
+    # Just-closed candle is at index n-2 (index n-1 is live)
+    last_closed_close = float(df['close'].iloc[-2])
+    last_closed_time  = df['time'].iloc[-2]
+
+    confirmed = []
+    failed    = []
+
+    with pending_lock:
+        # Iterate copy of keys (we mutate dict during loop)
+        keys_to_check = [k for k in pending_obs
+                         if pending_obs[k]['coin'] == coin
+                         and pending_obs[k]['tf'] == tf]
+        
+        for key in keys_to_check:
+            ob = pending_obs[key]
+
+            # Skip if pending OB was created from a fractal AFTER the last
+            # closed candle (shouldn't happen but safety check)
+            if ob['fractal_time'] >= last_closed_time:
+                continue
+
+            if ob['type'] == 'BULL':
+                if last_closed_close > ob['fractal_level']:
+                    # Confirmed
+                    ob['confirm_close'] = last_closed_close
+                    ob['confirm_time']  = last_closed_time
+                    confirmed.append(ob)
+                    del pending_obs[key]
+                elif last_closed_close < ob['ob_bot']:
+                    # Failed (closed below OB zone)
+                    ob['fail_close'] = last_closed_close
+                    ob['fail_time']  = last_closed_time
+                    failed.append(ob)
+                    del pending_obs[key]
+            else:  # BEAR
+                if last_closed_close < ob['fractal_level']:
+                    ob['confirm_close'] = last_closed_close
+                    ob['confirm_time']  = last_closed_time
+                    confirmed.append(ob)
+                    del pending_obs[key]
+                elif last_closed_close > ob['ob_top']:
+                    ob['fail_close'] = last_closed_close
+                    ob['fail_time']  = last_closed_time
+                    failed.append(ob)
+                    del pending_obs[key]
+
+    return confirmed, failed
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def send_msg(text: str):
+def send_msg(text):
     try:
         if bot is None or not CHAT_ID:
             return
@@ -448,45 +368,54 @@ def send_msg(text: str):
         logger.error(f"Telegram send error: {e}")
 
 
-def fmt_compact(coin: str, tf: str, ob: dict) -> str:
+def fmt_pre(ob):
     is_bull = ob['type'] == 'BULL'
-    stage   = ob['stage']
-    if stage == 'CONFIRMED':
-        emoji = '🟢' if is_bull else '🔴'
-        label = 'Bull OB' if is_bull else 'Bear OB'
-        prefix = ''
-    else:
-        emoji = '🟡'
-        label = 'POTENTIAL Bull OB' if is_bull else 'POTENTIAL Bear OB'
-        prefix = '⚠️ PRE-ALERT — '
-    top = ob['top_level']
-    bot = ob['bot_level']
+    label   = 'POTENTIAL Bull OB' if is_bull else 'POTENTIAL Bear OB'
     return (
-        f"{emoji} {prefix}{coin} {tf} | {label}\n"
-        f"Zone: {bot:,.4f} – {top:,.4f}"
+        f"🟡 PRE-ALERT — {ob['coin']} {ob['tf']} | {label}\n"
+        f"Zone: {ob['ob_bot']:,.4f} – {ob['ob_top']:,.4f}\n"
+        f"Watch: {ob['fractal_level']:,.4f}"
+    )
+
+
+def fmt_confirmed(ob):
+    is_bull = ob['type'] == 'BULL'
+    emoji   = '🟢' if is_bull else '🔴'
+    label   = 'Bull OB' if is_bull else 'Bear OB'
+    return (
+        f"{emoji} CONFIRMED — {ob['coin']} {ob['tf']} | {label}\n"
+        f"Zone: {ob['ob_bot']:,.4f} – {ob['ob_top']:,.4f}"
+    )
+
+
+def fmt_failed(ob):
+    is_bull = ob['type'] == 'BULL'
+    label   = 'Bull OB' if is_bull else 'Bear OB'
+    return (
+        f"❌ FAILED — {ob['coin']} {ob['tf']} | {label}\n"
+        f"Zone was: {ob['ob_bot']:,.4f} – {ob['ob_top']:,.4f}\n"
+        f"Closed at: {ob['fail_close']:,.4f}"
     )
 
 
 def send_startup_msg():
     send_msg(
-        f"🤖 <b>OB Alert Bot — LIVE (STRICT)</b>\n"
+        f"🤖 <b>OB Alert Bot — LIFECYCLE MODE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Coins:</b> {', '.join(COINS)}\n"
         f"<b>Timeframes:</b> {', '.join(TIMEFRAMES)}\n\n"
-        f"<b>Mode:</b> Nephew_Sam_ replica\n"
-        f"<b>Fractal:</b> {FRACTAL_TYPE}-bar\n"
-        f"<b>FVG required:</b> {REQUIRE_FVG}\n"
-        f"<b>OB lookback:</b> {OB_SEARCH_LOOKBACK}\n"
-        f"<b>Skip overlap:</b> {SKIP_OVERLAP}\n"
-        f"<b>Fresh only:</b> {FRESH_ONLY}\n"
-        f"<b>Max break age:</b> {MAX_BREAK_AGE_BARS} candles\n\n"
-        f"<b>Alerts:</b>\n"
-        f"  🟡 PRE-ALERT — fires only LATE in candle:\n"
-        f"     • 15m: minute 8–15 of candle\n"
-        f"     • 1H:  minute 40–60 of candle\n"
-        f"  🟢 CONFIRMED — within last {MAX_BREAK_AGE_BARS} closed candles\n\n"
-        f"<b>Scan:</b> Every 1 minute\n"
-        f"<b>Cooldown:</b> 30 min per type\n\n"
+        f"<b>3 Alert States:</b>\n"
+        f"  🟡 PRE-ALERT — OB candidate detected\n"
+        f"  🟢 CONFIRMED — candle closes beyond fractal\n"
+        f"  ❌ FAILED — candle closes outside OB zone\n\n"
+        f"<b>Settings:</b>\n"
+        f"  Fractal: {FRACTAL_TYPE}-bar\n"
+        f"  FVG required: {REQUIRE_FVG}\n"
+        f"  OB lookback: {OB_SEARCH_LOOKBACK}\n"
+        f"  Skip overlap: {SKIP_OVERLAP}\n"
+        f"  Fresh only: {FRESH_ONLY}\n"
+        f"  Max pre-alert age: {MAX_PREALERT_AGE_BARS} bars\n\n"
+        f"<b>Scan:</b> Every 1 minute\n\n"
         f"<i>Data: Binance.US</i>"
     )
 
@@ -495,6 +424,10 @@ def send_startup_msg():
 # SCAN LOOP
 # ============================================================
 
+# Track which pending OBs we've already pre-alerted (per key)
+prealert_sent = set()
+
+
 def scan_all():
     try:
         now = datetime.now(timezone.utc)
@@ -502,7 +435,6 @@ def scan_all():
 
         for coin_name, coin_ticker in COINS.items():
             for tf_label, tf_interval in TIMEFRAMES.items():
-
                 df = fetch_klines(
                     coin_ticker,
                     BINANCE_INTERVAL[tf_interval],
@@ -512,84 +444,56 @@ def scan_all():
                     logger.warning(f"No data: {coin_name} {tf_label}")
                     continue
 
-                confirmed_obs, prealert_obs = detect_obs(df)
+                # ── Step 1: Check pending OBs for confirmation/failure ──
+                confirmed, failed = check_pending_status(coin_name, tf_label, df)
 
-                # CONFIRMED alerts
-                confirmed_obs.sort(key=lambda o: o['break_idx'], reverse=True)
-                count_conf = 0
-                for ob in confirmed_obs[:MAX_OBS_PER_COIN]:
-                    sig = (
-                        f"CONF_{coin_name}_{tf_label}_{ob['type']}_"
-                        f"{pd.Timestamp(ob['ob_time']).isoformat()}_"
-                        f"{pd.Timestamp(ob['break_time']).isoformat()}"
-                    )
-                    if sig in sent_signatures:
-                        continue
-                    ck = f"{coin_name}_{tf_label}_{ob['type']}"
-                    if (time.time() - last_alerts.get(ck, 0)
-                            < COOLDOWN_SECONDS):
-                        continue
-                    send_msg(fmt_compact(coin_name, tf_label, ob))
-                    sent_signatures.add(sig)
-                    last_alerts[ck] = time.time()
-                    count_conf += 1
+                for ob in confirmed:
+                    send_msg(fmt_confirmed(ob))
                     logger.info(
-                        f"✅ CONFIRMED {ob['type']} OB {coin_name} {tf_label} | "
-                        f"break_age={ob['break_age']} | "
-                        f"zone[{ob['bot_level']:.4f}–{ob['top_level']:.4f}]"
+                        f"✅ CONFIRMED {ob['type']} {coin_name} {tf_label} | "
+                        f"close={ob['confirm_close']:.4f} > fract={ob['fractal_level']:.4f}"
+                        if ob['type'] == 'BULL' else
+                        f"✅ CONFIRMED {ob['type']} {coin_name} {tf_label} | "
+                        f"close={ob['confirm_close']:.4f} < fract={ob['fractal_level']:.4f}"
                     )
 
-                # PRE-ALERTS (only after candle reaches min age)
-                count_pre = 0
-                if len(df) > 0:
-                    is_old_enough, candle_age = is_candle_old_enough(df, tf_label)
-
-                    if not is_old_enough:
-                        if prealert_obs:
-                            min_age = PREALERT_MIN_AGE_MINUTES.get(tf_label, 0)
-                            logger.info(
-                                f"   ⏳ {coin_name} {tf_label}: "
-                                f"{len(prealert_obs)} pre-alert(s) WAITING "
-                                f"(candle age {candle_age}m < {min_age}m)"
-                            )
-                    else:
-                        live_candle_time = df['time'].iloc[-1]
-                        for ob in prealert_obs[:MAX_OBS_PER_COIN]:
-                            sig = (
-                                f"PRE_{coin_name}_{tf_label}_{ob['type']}_"
-                                f"{pd.Timestamp(live_candle_time).isoformat()}"
-                            )
-                            if sig in prealert_signatures:
-                                continue
-                            send_msg(fmt_compact(coin_name, tf_label, ob))
-                            prealert_signatures.add(sig)
-                            count_pre += 1
-                            logger.info(
-                                f"⚠️ PRE-ALERT {ob['type']} OB {coin_name} {tf_label} | "
-                                f"candle_age={candle_age}m | "
-                                f"live_close={ob['live_close']:.4f} | "
-                                f"zone[{ob['bot_level']:.4f}–{ob['top_level']:.4f}]"
-                            )
-
-                if count_conf or count_pre:
+                for ob in failed:
+                    send_msg(fmt_failed(ob))
                     logger.info(
-                        f"   → {coin_name} {tf_label}: "
-                        f"{count_conf} confirmed, {count_pre} pre-alerts"
+                        f"❌ FAILED {ob['type']} {coin_name} {tf_label} | "
+                        f"close={ob['fail_close']:.4f}"
                     )
+
+                # ── Step 2: Detect new pending OBs ──────────
+                new_obs = detect_new_pending(df, coin_name, tf_label)
+                with pending_lock:
+                    for ob in new_obs:
+                        if ob['key'] in pending_obs:
+                            continue   # already tracking
+                        if ob['key'] in prealert_sent:
+                            continue   # already alerted (e.g. failed/confirmed earlier)
+                        pending_obs[ob['key']] = ob
+                        prealert_sent.add(ob['key'])
+                        send_msg(fmt_pre(ob))
+                        logger.info(
+                            f"🟡 PRE-ALERT {ob['type']} {coin_name} {tf_label} | "
+                            f"zone[{ob['ob_bot']:.4f}–{ob['ob_top']:.4f}] | "
+                            f"watch={ob['fractal_level']:.4f}"
+                        )
 
                 time.sleep(0.2)
 
-        if len(sent_signatures) > 5000:
-            for s in list(sent_signatures)[:2500]:
-                sent_signatures.discard(s)
-        if len(prealert_signatures) > 5000:
-            for s in list(prealert_signatures)[:2500]:
-                prealert_signatures.discard(s)
+        # Trim memory
+        if len(prealert_sent) > 5000:
+            for s in list(prealert_sent)[:2500]:
+                prealert_sent.discard(s)
+
+        with pending_lock:
+            pend_count = len(pending_obs)
 
         logger.info(
-            f"✅ Scan complete — "
-            f"{len(sent_signatures)} confirmed | "
-            f"{len(prealert_signatures)} pre-alerts (lifetime)"
+            f"✅ Scan complete — {pend_count} pending | "
+            f"{len(prealert_sent)} pre-alerts (lifetime)"
         )
 
     except Exception as e:
@@ -605,17 +509,23 @@ def index():
     now = datetime.now(timezone.utc)
     coins_html = ''.join(f"<li>{c}/USDT</li>" for c in COINS)
     tfs_html   = ''.join(f"<li>{tf}</li>" for tf in TIMEFRAMES)
+
+    with pending_lock:
+        pending_html = ''.join(
+            f"<li>{ob['coin']} {ob['tf']} {ob['type']} | "
+            f"zone {ob['ob_bot']:.4f}-{ob['ob_top']:.4f} | "
+            f"watch {ob['fractal_level']:.4f}</li>"
+            for ob in pending_obs.values()
+        ) or '<li>(none)</li>'
+
     return (
-        f"<h2>🤖 Order Block Alert Bot (STRICT)</h2>"
+        f"<h2>🤖 Order Block Alert Bot — Lifecycle Mode</h2>"
         f"<p><b>Status:</b> ✅ Running</p>"
         f"<p><b>Time UTC:</b> {now.strftime('%Y-%m-%d %H:%M:%S')}</p>"
-        f"<p><b>Mode:</b> Pine Script replica + close confirm</p>"
+        f"<p><b>Mode:</b> 3-state lifecycle (pre / confirmed / failed)</p>"
         f"<p><b>Data:</b> Binance.US | <b>Scan:</b> 1 min</p>"
-        f"<p><b>Max break age:</b> {MAX_BREAK_AGE_BARS} candles</p>"
-        f"<p><b>Pre-alert min age:</b> 15m={PREALERT_MIN_AGE_MINUTES['15m']}m, "
-        f"1h={PREALERT_MIN_AGE_MINUTES['1h']}m</p>"
-        f"<p><b>Confirmed sent:</b> {len(sent_signatures)}</p>"
-        f"<p><b>Pre-alerts sent:</b> {len(prealert_signatures)}</p>"
+        f"<p><b>Pre-alerts sent (lifetime):</b> {len(prealert_sent)}</p>"
+        f"<h3>Currently Pending OBs:</h3><ul>{pending_html}</ul>"
         f"<h3>Monitoring:</h3><ul>{coins_html}</ul>"
         f"<h3>Timeframes:</h3><ul>{tfs_html}</ul>"
         f"<p>"
@@ -633,26 +543,36 @@ def health():
 
 @app.route('/status')
 def status():
+    with pending_lock:
+        pend_list = [
+            {
+                'coin': ob['coin'],
+                'tf':   ob['tf'],
+                'type': ob['type'],
+                'ob_top': ob['ob_top'],
+                'ob_bot': ob['ob_bot'],
+                'fractal_level': ob['fractal_level'],
+            }
+            for ob in pending_obs.values()
+        ]
     return {
-        'status':           'running',
-        'mode':             'STRICT + late pre-alerts',
-        'time_utc':         datetime.now(timezone.utc).isoformat(),
-        'coins':            list(COINS.keys()),
-        'timeframes':       list(TIMEFRAMES.keys()),
-        'confirmed_sent':   len(sent_signatures),
-        'prealerts_sent':   len(prealert_signatures),
-        'cooldowns':        len(last_alerts),
+        'status':         'running',
+        'mode':           'Lifecycle (pre/confirmed/failed)',
+        'time_utc':       datetime.now(timezone.utc).isoformat(),
+        'coins':          list(COINS.keys()),
+        'timeframes':     list(TIMEFRAMES.keys()),
+        'pending_count':  len(pend_list),
+        'pending_obs':    pend_list,
+        'prealerts_sent_lifetime': len(prealert_sent),
         'settings': {
-            'fractal_type':            FRACTAL_TYPE,
-            'require_fvg':             REQUIRE_FVG,
-            'max_ob_to_fvg_bars':      MAX_OB_TO_FVG_BARS,
-            'ob_search_lookback':      OB_SEARCH_LOOKBACK,
-            'skip_overlap':            SKIP_OVERLAP,
-            'overlap_window':          OVERLAP_WINDOW,
-            'fresh_only':              FRESH_ONLY,
-            'max_obs_per_coin':        MAX_OBS_PER_COIN,
-            'max_break_age_bars':      MAX_BREAK_AGE_BARS,
-            'prealert_min_age_minutes':PREALERT_MIN_AGE_MINUTES,
+            'fractal_type':           FRACTAL_TYPE,
+            'require_fvg':            REQUIRE_FVG,
+            'max_ob_to_fvg_bars':     MAX_OB_TO_FVG_BARS,
+            'ob_search_lookback':     OB_SEARCH_LOOKBACK,
+            'skip_overlap':           SKIP_OVERLAP,
+            'overlap_window':         OVERLAP_WINDOW,
+            'fresh_only':             FRESH_ONLY,
+            'max_prealert_age_bars':  MAX_PREALERT_AGE_BARS,
         },
     }
 
@@ -665,9 +585,10 @@ def scan_now_route():
 
 @app.route('/reset')
 def reset():
-    sent_signatures.clear()
-    prealert_signatures.clear()
-    last_alerts.clear()
+    global pending_obs, prealert_sent
+    with pending_lock:
+        pending_obs.clear()
+    prealert_sent.clear()
     return 'Reset done!', 200
 
 
@@ -676,7 +597,7 @@ def reset():
 # ============================================================
 
 def start_bot():
-    logger.info("Order Block Bot starting (STRICT + late pre-alerts)…")
+    logger.info("Order Block Bot starting (Lifecycle mode)…")
     try:
         send_startup_msg()
     except Exception as e:
