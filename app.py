@@ -1,9 +1,12 @@
 # ============================================================
-# SMT ALERT BOT
-# Coins: BTC, ETH, SOL, BNB  |  Timeframes: 15m, 1H
-# Comparison: Synthetic BTC Dominance from Binance.US data
-# ALL data from Binance.US — no external APIs needed
-# Scan: every 5 min | BTC.D refresh: every 15 min
+# ORDER BLOCK ALERT BOT
+# Coins: BTC, ETH, SOL  |  Timeframes: 15m, 1H
+# Logic: Nephew_Sam_ replica + close confirmation
+# Two-stage alerts:
+#   🟡 PRE-ALERT  → live candle currently breaking fractal
+#   🟢 CONFIRMED  → candle closed beyond fractal
+# Data: Binance.US (no external APIs, no API keys)
+# Scan: Every 1 minute
 # ============================================================
 
 import os
@@ -21,29 +24,12 @@ import telebot
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID        = os.environ.get('CHAT_ID', '')
 
-# ── Coins to monitor ─────────────────────────────────────────
+# ── Coins ────────────────────────────────────────────────────
 COINS = {
     'BTC': 'BTCUSDT',
     'ETH': 'ETHUSDT',
     'SOL': 'SOLUSDT',
-    'BNB': 'BNBUSDT',
 }
-
-# ── Dominance basket (circulating supplies — May 2025) ───────
-DOMINANCE_BASKET = {
-    'BTCUSDT':   19_700_000,
-    'ETHUSDT':   120_270_000,
-    'BNBUSDT':   140_890_000,
-    'SOLUSDT':   465_000_000,
-    'XRPUSDT':   57_800_000_000,
-    'ADAUSDT':   35_600_000_000,
-    'AVAXUSDT':  410_000_000,
-    'DOGEUSDT':  146_000_000_000,
-    'MATICUSDT': 9_900_000_000,
-    'DOTUSDT':   1_430_000_000,
-}
-
-COMP_LABEL = 'BTC.D'
 
 # ── Timeframes ───────────────────────────────────────────────
 TIMEFRAMES = {
@@ -55,26 +41,23 @@ TIMEFRAMES = {
 BINANCE_US_BASE  = 'https://api.binance.us/api/v3'
 BINANCE_INTERVAL = {'15m': '15m', '1h': '1h'}
 
-# ── SMT Settings ─────────────────────────────────────────────
-PIVOT_LOOKBACK   = 1
-PIVOT_A_STRENGTH = 2
-SYNC_TOL         = 2
-MAX_SIGNAL_SPAN  = 180
-CROSS_TOL_PCT    = 0.02
+# ── OB Detection Settings (matches Pine Script defaults) ─────
+FRACTAL_TYPE        = 3      # 3-bar fractal (1 left, 1 right)
+REQUIRE_FVG         = True
+MAX_OB_TO_FVG_BARS  = 3
+OB_SEARCH_LOOKBACK  = 5
+SKIP_OVERLAP        = True
+OVERLAP_WINDOW      = 20
+FRESH_ONLY          = True
 
-# ── Timing ───────────────────────────────────────────────────
-COOLDOWN_SECONDS     = 30 * 60
-BTCD_REFRESH_MINUTES = 15
-
-# ── BTC.D Cache ──────────────────────────────────────────────
-BTCD_CACHE:    dict = {}
-BTCD_CACHE_TS: dict = {}
-BTCD_LOCK    = threading.Lock()
-BTCD_READY   = threading.Event()   # ← signals when BOTH tfs loaded
+# ── Cooldown ─────────────────────────────────────────────────
+COOLDOWN_SECONDS    = 30 * 60      # 30 min same coin/tf/type
+MAX_OBS_PER_COIN    = 3            # Max OBs per scan per coin
 
 # ── Alert state ──────────────────────────────────────────────
-last_alerts     = {}
-sent_signatures = set()
+last_alerts          = {}
+sent_signatures      = set()       # confirmed dedup (permanent)
+prealert_signatures  = set()       # pre-alert dedup (per candle)
 
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -93,11 +76,15 @@ except Exception as e:
 
 
 # ============================================================
-# BINANCE.US — OHLC FETCH
+# BINANCE.US DATA
 # ============================================================
 
 def fetch_klines(symbol: str, interval: str,
                  limit: int = 500) -> pd.DataFrame | None:
+    """
+    Fetch OHLC including the CURRENTLY FORMING candle (last row).
+    The last row is live and updates with each tick.
+    """
     try:
         resp = requests.get(
             f"{BINANCE_US_BASE}/klines",
@@ -113,309 +100,349 @@ def fetch_klines(symbol: str, interval: str,
                 f"Binance.US {resp.status_code} — {symbol}/{interval}"
             )
             return None
-
         klines = resp.json()
         if not klines or isinstance(klines, dict):
             return None
-
         df = pd.DataFrame(klines, columns=[
             'time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'qav', 'num_trades',
             'taker_base', 'taker_quote', 'ignore',
         ])
-        df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True)
+        df['time']       = pd.to_datetime(df['time'],       unit='ms', utc=True)
+        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
         for col in ['open', 'high', 'low', 'close']:
             df[col] = df[col].astype(float)
-
-        return df[['time', 'open', 'high', 'low', 'close']]
-
+        return df[['time', 'open', 'high', 'low', 'close', 'close_time']].reset_index(drop=True)
     except Exception as e:
         logger.error(f"fetch_klines {symbol}/{interval}: {e}")
         return None
 
 
 # ============================================================
-# SYNTHETIC BTC DOMINANCE
+# FRACTAL DETECTION (matches Pine Script)
 # ============================================================
 
-def build_btcd_ohlc(interval: str) -> pd.DataFrame | None:
-    try:
-        bin_interval = BINANCE_INTERVAL.get(interval, '15m')
-
-        # Fetch all basket symbols
-        price_data: dict = {}
-        for symbol in DOMINANCE_BASKET:
-            df = fetch_klines(symbol, bin_interval, limit=500)
-            if df is not None:
-                price_data[symbol] = df.set_index('time')
-            else:
-                logger.warning(
-                    f"BTC.D basket: could not fetch {symbol} — skipping"
-                )
-            time.sleep(0.2)
-
-        if 'BTCUSDT' not in price_data:
-            logger.error("BTCUSDT missing — cannot compute BTC.D")
-            return None
-
-        if len(price_data) < 3:
-            logger.error(
-                f"Only {len(price_data)} basket symbols — aborting"
-            )
-            return None
-
-        # Build candle-by-candle
-        btc_df  = price_data['BTCUSDT']
-        records = []
-
-        for ts in btc_df.index:
-            total_mcap = 0.0
-            for symbol, supply in DOMINANCE_BASKET.items():
-                sym_df = price_data.get(symbol)
-                if sym_df is not None and ts in sym_df.index:
-                    total_mcap += sym_df.loc[ts, 'close'] * supply
-
-            if total_mcap <= 0:
-                continue
-
-            btc_supply = DOMINANCE_BASKET['BTCUSDT']
-            records.append({
-                'time':  ts,
-                'open':  (btc_df.loc[ts, 'open']  * btc_supply / total_mcap) * 100.0,
-                'high':  (btc_df.loc[ts, 'high']  * btc_supply / total_mcap) * 100.0,
-                'low':   (btc_df.loc[ts, 'low']   * btc_supply / total_mcap) * 100.0,
-                'close': (btc_df.loc[ts, 'close'] * btc_supply / total_mcap) * 100.0,
-            })
-
-        if len(records) < 20:
-            logger.error(
-                f"BTC.D {interval}: only {len(records)} candles"
-            )
-            return None
-
-        ohlc = (
-            pd.DataFrame(records)
-            .sort_values('time')
-            .reset_index(drop=True)
-        )
-
-        logger.info(
-            f"✅ BTC.D {interval}: {len(ohlc)} candles | "
-            f"latest = {ohlc['close'].iloc[-1]:.3f}% | "
-            f"basket = {len(price_data)}/{len(DOMINANCE_BASKET)} symbols"
-        )
-        return ohlc
-
-    except Exception as e:
-        logger.error(f"build_btcd_ohlc {interval}: {e}")
-        return None
-
-
-def refresh_btcd_cache():
-    """
-    Rebuild BTC.D for all timeframes.
-    Sets BTCD_READY event once both timeframes are loaded.
-    """
-    logger.info("BTC.D cache refresh starting…")
-    loaded = 0
-
-    for tf in ['15m', '1h']:
-        df = build_btcd_ohlc(tf)
-        with BTCD_LOCK:
-            if df is not None:
-                BTCD_CACHE[tf]    = df
-                BTCD_CACHE_TS[tf] = time.time()
-                loaded += 1
-            else:
-                if tf in BTCD_CACHE:
-                    logger.warning(
-                        f"BTC.D {tf} failed — keeping stale cache"
-                    )
-                    loaded += 1   # stale is still usable
-                else:
-                    logger.warning(
-                        f"BTC.D {tf} failed — no data available yet"
-                    )
-        if tf == '15m':
-            time.sleep(2)
-
-    # Signal that cache is ready for scanning
-    if loaded == len(TIMEFRAMES) and not BTCD_READY.is_set():
-        BTCD_READY.set()
-        logger.info("✅ BTC.D ready — scan loop unblocked")
-
-    logger.info("BTC.D cache refresh complete")
-
-
-def get_btcd(tf: str) -> pd.DataFrame | None:
-    with BTCD_LOCK:
-        return BTCD_CACHE.get(tf)
-
-
-# ============================================================
-# PIVOT DETECTION
-# ============================================================
-
-def detect_pivots(values: dict, left: int, right: int):
-    highs, lows = [], []
-    n = len(values['high'])
-    for i in range(left, n - right):
-        hi = lo = True
-        for k in range(1, left + 1):
-            if values['high'][i - k] >= values['high'][i]: hi = False
-            if values['low'][i - k]  <= values['low'][i]:  lo = False
-        for k in range(1, right + 1):
-            if values['high'][i + k] >= values['high'][i]: hi = False
-            if values['low'][i + k]  <= values['low'][i]:  lo = False
-        if hi: highs.append((i, values['high'][i]))
-        if lo: lows.append((i,  values['low'][i]))
-    return highs, lows
-
-
-def cross_ok(highs, lows, bar_a, px_a,
-             bar_b, px_b, is_bear: bool) -> bool:
-    span = bar_b - bar_a - 1
-    if span <= 0:              return True
-    if span > MAX_SIGNAL_SPAN: return False
-    for d in range(1, span + 1):
-        idx = bar_a + d
-        if idx >= len(highs): return False
-        line_px = px_a + (px_b - px_a) * d / (bar_b - bar_a)
-        tol_px  = abs(line_px) * CROSS_TOL_PCT / 100.0
-        if is_bear     and highs[idx] > line_px + tol_px: return False
-        if not is_bear and lows[idx]  < line_px - tol_px: return False
+def is_fractal_high(highs, idx: int, side: int) -> bool:
+    n = len(highs)
+    if idx - side < 0 or idx + side >= n: return False
+    pivot = highs[idx]
+    for k in range(1, side + 1):
+        if highs[idx - k] >= pivot: return False
+        if highs[idx + k] >= pivot: return False
     return True
 
 
-def near_pivot(pivots, target: int, tol: int) -> int:
-    best, best_d = -1, tol + 1
-    for i, (b, _) in enumerate(pivots):
-        d = abs(b - target)
-        if d <= tol and d < best_d:
-            best_d, best = d, i
-    return best
-
-
-def near_pivot_before(pivots, target: int,
-                       limit: int, tol: int) -> int:
-    best, best_d = -1, tol + 1
-    for i, (b, _) in enumerate(pivots):
-        if b >= limit: continue
-        d = abs(b - target)
-        if d <= tol and d < best_d:
-            best_d, best = d, i
-    return best
+def is_fractal_low(lows, idx: int, side: int) -> bool:
+    n = len(lows)
+    if idx - side < 0 or idx + side >= n: return False
+    pivot = lows[idx]
+    for k in range(1, side + 1):
+        if lows[idx - k] <= pivot: return False
+        if lows[idx + k] <= pivot: return False
+    return True
 
 
 # ============================================================
-# SMT DETECTION
+# FVG DETECTION
 # ============================================================
 
-def detect_smt(coin_df: pd.DataFrame,
-               comp_df: pd.DataFrame,
-               comp_label: str) -> list:
-    if coin_df is None or comp_df is None:      return []
-    if len(coin_df) < 50 or len(comp_df) < 50: return []
+def has_bullish_fvg_after(highs, lows, ob_idx: int,
+                           max_bars: int, n: int) -> int:
+    """Bullish FVG: low[i+2] > high[i]. Returns index of FVG or -1."""
+    end = min(n - 2, ob_idx + max_bars)
+    for i in range(ob_idx, end + 1):
+        if i + 2 >= n: break
+        if lows[i + 2] > highs[i]:
+            return i + 1
+    return -1
 
-    n       = min(len(coin_df), len(comp_df))
-    coin_df = coin_df.tail(n).reset_index(drop=True)
-    comp_df = comp_df.tail(n).reset_index(drop=True)
 
-    cv = {
-        'high': coin_df['high'].values.astype(float),
-        'low':  coin_df['low'].values.astype(float),
-    }
-    xv = {
-        'high': comp_df['high'].values.astype(float),
-        'low':  comp_df['low'].values.astype(float),
-    }
+def has_bearish_fvg_after(highs, lows, ob_idx: int,
+                           max_bars: int, n: int) -> int:
+    """Bearish FVG: high[i+2] < low[i]. Returns index of FVG or -1."""
+    end = min(n - 2, ob_idx + max_bars)
+    for i in range(ob_idx, end + 1):
+        if i + 2 >= n: break
+        if highs[i + 2] < lows[i]:
+            return i + 1
+    return -1
 
-    cb_hi, cb_lo = detect_pivots(cv, PIVOT_LOOKBACK,   PIVOT_LOOKBACK)
-    xb_hi, xb_lo = detect_pivots(xv, PIVOT_LOOKBACK,   PIVOT_LOOKBACK)
-    ca_hi, ca_lo = detect_pivots(cv, PIVOT_A_STRENGTH,  PIVOT_A_STRENGTH)
 
-    latest  = n - 1 - PIVOT_LOOKBACK
-    signals = []
+# ============================================================
+# OB DETECTION — Nephew_Sam_ replica
+# ============================================================
 
-    # ── BEAR ─────────────────────────────────────────────────
-    cph = next(((b, v) for b, v in cb_hi if b == latest), None)
-    if cph:
-        bar_b, px_b = cph
-        xi = near_pivot(xb_hi, bar_b, SYNC_TOL)
-        if xi >= 0:
-            xbar_b, xpx_b = xb_hi[xi]
-            for bar_a, px_a in reversed(ca_hi):
-                span = bar_b - bar_a
-                if span <= 0:              continue
-                if span > MAX_SIGNAL_SPAN: break
-                xai = near_pivot_before(
-                    xb_hi, bar_a, xbar_b, SYNC_TOL
+def is_bullish(o: float, c: float) -> bool:
+    return c > o
+
+
+def is_bearish(o: float, c: float) -> bool:
+    return c < o
+
+
+def detect_obs(df: pd.DataFrame, include_live: bool = True) -> tuple[list, list]:
+    """
+    Detect Order Blocks following the Pine Script logic exactly.
+
+    Returns (confirmed_obs, prealert_obs)
+
+    confirmed_obs: OBs where a CLOSED candle has broken a fractal level
+    prealert_obs:  OBs where the CURRENTLY FORMING candle is breaking a level
+                   (price hasn't closed yet, but is currently beyond)
+    """
+    n = len(df)
+    side = 1 if FRACTAL_TYPE == 3 else 2
+
+    if n < (side * 2 + 10):
+        return [], []
+
+    opens  = df['open'].values
+    highs  = df['high'].values
+    lows   = df['low'].values
+    closes = df['close'].values
+    times  = df['time'].values
+
+    # The last row is the LIVE forming candle
+    live_idx = n - 1   # currently forming candle index
+
+    # Find all fractal pivots (must exclude live candle and those too close to edge)
+    fractal_highs = []   # [(idx, level)]
+    fractal_lows  = []
+    for i in range(side, n - side):
+        # Don't use fractals where the right side includes the live candle
+        # because that candle isn't closed yet
+        if i + side >= live_idx:
+            continue
+        if is_fractal_high(highs, i, side):
+            fractal_highs.append((i, highs[i]))
+        if is_fractal_low(lows, i, side):
+            fractal_lows.append((i, lows[i]))
+
+    confirmed_obs = []
+    prealert_obs  = []
+
+    # Track existing OB zones to check overlap
+    placed_bull_obs = []   # list of (top, bot, bar_idx)
+    placed_bear_obs = []
+
+    def overlaps_bull(top, bot, current_bar):
+        if not SKIP_OVERLAP: return False
+        for (t, b, idx) in placed_bull_obs:
+            if current_bar - idx > OVERLAP_WINDOW: continue
+            if not (bot > t or top < b):
+                return True
+        return False
+
+    def overlaps_bear(top, bot, current_bar):
+        if not SKIP_OVERLAP: return False
+        for (t, b, idx) in placed_bear_obs:
+            if current_bar - idx > OVERLAP_WINDOW: continue
+            if not (bot > t or top < b):
+                return True
+        return False
+
+    def is_bull_fresh(ob_bar, top, bot, until_bar):
+        """Check no candle between ob_bar+1 and until_bar-1 closed below bot."""
+        if not FRESH_ONLY: return True
+        for k in range(ob_bar + 1, until_bar):
+            if closes[k] < bot:
+                return False
+        return True
+
+    def is_bear_fresh(ob_bar, top, bot, until_bar):
+        if not FRESH_ONLY: return True
+        for k in range(ob_bar + 1, until_bar):
+            if closes[k] > top:
+                return False
+        return True
+
+    # ─────────────────────────────────────────────────────
+    # BULLISH OB: fractal HIGH broken by CLOSE above
+    # ─────────────────────────────────────────────────────
+    for f_idx, f_level in fractal_highs:
+        # Look for first candle AFTER f_idx that closes above f_level
+        # (using only CLOSED candles — exclude live)
+        break_idx = -1
+        for j in range(f_idx + side + 1, live_idx):   # exclude live
+            if closes[j] > f_level:
+                break_idx = j
+                break
+
+        # ── CONFIRMED OB on closed candle ────────────────
+        if break_idx > 0:
+            # Look back from break_idx for last RED candle = OB
+            ob_idx = -1
+            search_start = max(0, break_idx - OB_SEARCH_LOOKBACK)
+            for k in range(break_idx - 1, search_start - 1, -1):
+                if is_bearish(opens[k], closes[k]):
+                    ob_idx = k
+                    break
+            if ob_idx < 0: continue
+
+            # Check FVG
+            if REQUIRE_FVG:
+                fvg_idx = has_bullish_fvg_after(
+                    highs, lows, ob_idx, MAX_OB_TO_FVG_BARS, n
                 )
-                if xai >= 0:
-                    xbar_a, xpx_a = xb_hi[xai]
-                    if px_b > px_a and xpx_b < xpx_a:
-                        if (cross_ok(cv['high'], cv['low'],
-                                     bar_a, px_a,
-                                     bar_b, px_b, True) and
-                            cross_ok(xv['high'], xv['low'],
-                                     xbar_a, xpx_a,
-                                     xbar_b, xpx_b, True)):
-                            signals.append({
-                                'direction':  'BEAR',
-                                'comp_label': comp_label,
-                                'coin_bar_a': bar_a,
-                                'coin_px_a':  px_a,
-                                'coin_bar_b': bar_b,
-                                'coin_px_b':  px_b,
-                                'comp_bar_a': xbar_a,
-                                'comp_px_a':  xpx_a,
-                                'comp_bar_b': xbar_b,
-                                'comp_px_b':  xpx_b,
-                                'span':       span,
-                                'time_b':     coin_df['time'].iloc[bar_b],
-                            })
-                            break
+                if fvg_idx < 0: continue
 
-    # ── BULL ─────────────────────────────────────────────────
-    cpl = next(((b, v) for b, v in cb_lo if b == latest), None)
-    if cpl:
-        bar_b, px_b = cpl
-        xi = near_pivot(xb_lo, bar_b, SYNC_TOL)
-        if xi >= 0:
-            xbar_b, xpx_b = xb_lo[xi]
-            for bar_a, px_a in reversed(ca_lo):
-                span = bar_b - bar_a
-                if span <= 0:              continue
-                if span > MAX_SIGNAL_SPAN: break
-                xai = near_pivot_before(
-                    xb_lo, bar_a, xbar_b, SYNC_TOL
+            top_lvl = opens[ob_idx]      # candle OPEN
+            bot_lvl = lows[ob_idx]       # wick LOW
+
+            # Quality filters
+            if overlaps_bull(top_lvl, bot_lvl, ob_idx): continue
+            if not is_bull_fresh(ob_idx, top_lvl, bot_lvl, break_idx): continue
+
+            placed_bull_obs.append((top_lvl, bot_lvl, ob_idx))
+
+            confirmed_obs.append({
+                'type':         'BULL',
+                'stage':        'CONFIRMED',
+                'ob_idx':       ob_idx,
+                'fractal_idx':  f_idx,
+                'fractal_level':f_level,
+                'break_idx':    break_idx,
+                'break_close':  closes[break_idx],
+                'ob_open':      opens[ob_idx],
+                'ob_high':      highs[ob_idx],
+                'ob_low':       lows[ob_idx],
+                'ob_close':     closes[ob_idx],
+                'ob_time':      times[ob_idx],
+                'break_time':   times[break_idx],
+                'top_level':    top_lvl,
+                'bot_level':    bot_lvl,
+            })
+            continue   # move to next fractal
+
+        # ── PRE-ALERT: live candle currently above f_level ─
+        if include_live and closes[live_idx] > f_level:
+            # Look back from live for last RED candle = potential OB
+            ob_idx = -1
+            search_start = max(0, live_idx - OB_SEARCH_LOOKBACK)
+            for k in range(live_idx - 1, search_start - 1, -1):
+                if is_bearish(opens[k], closes[k]):
+                    ob_idx = k
+                    break
+            if ob_idx < 0: continue
+
+            if REQUIRE_FVG:
+                fvg_idx = has_bullish_fvg_after(
+                    highs, lows, ob_idx, MAX_OB_TO_FVG_BARS, n
                 )
-                if xai >= 0:
-                    xbar_a, xpx_a = xb_lo[xai]
-                    if px_b < px_a and xpx_b > xpx_a:
-                        if (cross_ok(cv['high'], cv['low'],
-                                     bar_a, px_a,
-                                     bar_b, px_b, False) and
-                            cross_ok(xv['high'], xv['low'],
-                                     xbar_a, xpx_a,
-                                     xbar_b, xpx_b, False)):
-                            signals.append({
-                                'direction':  'BULL',
-                                'comp_label': comp_label,
-                                'coin_bar_a': bar_a,
-                                'coin_px_a':  px_a,
-                                'coin_bar_b': bar_b,
-                                'coin_px_b':  px_b,
-                                'comp_bar_a': xbar_a,
-                                'comp_px_a':  xpx_a,
-                                'comp_bar_b': xbar_b,
-                                'comp_px_b':  xpx_b,
-                                'span':       span,
-                                'time_b':     coin_df['time'].iloc[bar_b],
-                            })
-                            break
+                if fvg_idx < 0: continue
 
-    return signals
+            top_lvl = opens[ob_idx]
+            bot_lvl = lows[ob_idx]
+
+            if overlaps_bull(top_lvl, bot_lvl, ob_idx): continue
+            if not is_bull_fresh(ob_idx, top_lvl, bot_lvl, live_idx): continue
+
+            prealert_obs.append({
+                'type':         'BULL',
+                'stage':        'PREALERT',
+                'ob_idx':       ob_idx,
+                'fractal_idx':  f_idx,
+                'fractal_level':f_level,
+                'live_close':   closes[live_idx],
+                'live_time':    times[live_idx],
+                'ob_open':      opens[ob_idx],
+                'ob_high':      highs[ob_idx],
+                'ob_low':       lows[ob_idx],
+                'ob_time':      times[ob_idx],
+                'top_level':    top_lvl,
+                'bot_level':    bot_lvl,
+            })
+
+    # ─────────────────────────────────────────────────────
+    # BEARISH OB: fractal LOW broken by CLOSE below
+    # ─────────────────────────────────────────────────────
+    for f_idx, f_level in fractal_lows:
+        break_idx = -1
+        for j in range(f_idx + side + 1, live_idx):
+            if closes[j] < f_level:
+                break_idx = j
+                break
+
+        if break_idx > 0:
+            ob_idx = -1
+            search_start = max(0, break_idx - OB_SEARCH_LOOKBACK)
+            for k in range(break_idx - 1, search_start - 1, -1):
+                if is_bullish(opens[k], closes[k]):
+                    ob_idx = k
+                    break
+            if ob_idx < 0: continue
+
+            if REQUIRE_FVG:
+                fvg_idx = has_bearish_fvg_after(
+                    highs, lows, ob_idx, MAX_OB_TO_FVG_BARS, n
+                )
+                if fvg_idx < 0: continue
+
+            top_lvl = highs[ob_idx]      # wick HIGH
+            bot_lvl = opens[ob_idx]      # candle OPEN
+
+            if overlaps_bear(top_lvl, bot_lvl, ob_idx): continue
+            if not is_bear_fresh(ob_idx, top_lvl, bot_lvl, break_idx): continue
+
+            placed_bear_obs.append((top_lvl, bot_lvl, ob_idx))
+
+            confirmed_obs.append({
+                'type':         'BEAR',
+                'stage':        'CONFIRMED',
+                'ob_idx':       ob_idx,
+                'fractal_idx':  f_idx,
+                'fractal_level':f_level,
+                'break_idx':    break_idx,
+                'break_close':  closes[break_idx],
+                'ob_open':      opens[ob_idx],
+                'ob_high':      highs[ob_idx],
+                'ob_low':       lows[ob_idx],
+                'ob_close':     closes[ob_idx],
+                'ob_time':      times[ob_idx],
+                'break_time':   times[break_idx],
+                'top_level':    top_lvl,
+                'bot_level':    bot_lvl,
+            })
+            continue
+
+        if include_live and closes[live_idx] < f_level:
+            ob_idx = -1
+            search_start = max(0, live_idx - OB_SEARCH_LOOKBACK)
+            for k in range(live_idx - 1, search_start - 1, -1):
+                if is_bullish(opens[k], closes[k]):
+                    ob_idx = k
+                    break
+            if ob_idx < 0: continue
+
+            if REQUIRE_FVG:
+                fvg_idx = has_bearish_fvg_after(
+                    highs, lows, ob_idx, MAX_OB_TO_FVG_BARS, n
+                )
+                if fvg_idx < 0: continue
+
+            top_lvl = highs[ob_idx]
+            bot_lvl = opens[ob_idx]
+
+            if overlaps_bear(top_lvl, bot_lvl, ob_idx): continue
+            if not is_bear_fresh(ob_idx, top_lvl, bot_lvl, live_idx): continue
+
+            prealert_obs.append({
+                'type':         'BEAR',
+                'stage':        'PREALERT',
+                'ob_idx':       ob_idx,
+                'fractal_idx':  f_idx,
+                'fractal_level':f_level,
+                'live_close':   closes[live_idx],
+                'live_time':    times[live_idx],
+                'ob_open':      opens[ob_idx],
+                'ob_high':      highs[ob_idx],
+                'ob_low':       lows[ob_idx],
+                'ob_time':      times[ob_idx],
+                'top_level':    top_lvl,
+                'bot_level':    bot_lvl,
+            })
+
+    return confirmed_obs, prealert_obs
 
 
 # ============================================================
@@ -431,61 +458,47 @@ def send_msg(text: str):
         logger.error(f"Telegram send error: {e}")
 
 
-def format_signal(coin: str, tf: str, sig: dict) -> str:
-    d     = sig['direction']
-    emoji = '🟢' if d == 'BULL' else '🔴'
+def fmt_compact(coin: str, tf: str, ob: dict) -> str:
+    """Compact alert format as you specified."""
+    is_bull = ob['type'] == 'BULL'
+    stage   = ob['stage']
 
-    if d == 'BULL':
-        ac = '↓ Lower Low'
-        ax = '↑ Higher Low  ← BTC.D DIVERGED'
-        w  = '🎯 Watch for reversal UP'
-        n  = ('Coin drops while BTC dominance rises → '
-              'altcoin underperforming → reversal UP expected')
-    else:
-        ac = '↑ Higher High'
-        ax = '↓ Lower High  ← BTC.D DIVERGED'
-        w  = '🎯 Watch for reversal DOWN'
-        n  = ('Coin pumps while BTC dominance falls → '
-              'altcoin overperforming → reversal DOWN expected')
+    if stage == 'CONFIRMED':
+        emoji = '🟢' if is_bull else '🔴'
+        label = 'Bull OB' if is_bull else 'Bear OB'
+        prefix = ''
+    else:   # PREALERT
+        emoji = '🟡'
+        label = 'POTENTIAL Bull OB' if is_bull else 'POTENTIAL Bear OB'
+        prefix = '⚠️ PRE-ALERT — '
 
-    ts = pd.Timestamp(sig['time_b']).strftime('%H:%M UTC %d-%b')
+    top = ob['top_level']
+    bot = ob['bot_level']
 
     return (
-        f"{emoji} <b>{d} SMT — {coin}/USDT {tf}</b>\n"
-        f"{'─'*32}\n"
-        f"<b>Coin Pivot A:</b>   ${sig['coin_px_a']:,.4f}  "
-        f"({sig['span']} bars ago)\n"
-        f"<b>Coin Pivot B:</b>   ${sig['coin_px_b']:,.4f}  (now)\n"
-        f"<b>Coin Move:</b>      {ac}\n\n"
-        f"<b>BTC.D Pivot A:</b>  {sig['comp_px_a']:.3f}%\n"
-        f"<b>BTC.D Pivot B:</b>  {sig['comp_px_b']:.3f}%\n"
-        f"<b>BTC.D Move:</b>     {ax}\n\n"
-        f"<b>Span:</b>  {sig['span']} bars\n"
-        f"<b>Time:</b>  {ts}\n\n"
-        f"<i>{n}</i>\n\n"
-        f"{w}"
+        f"{emoji} {prefix}{coin} {tf} | {label}\n"
+        f"Zone: {bot:,.4f} – {top:,.4f}"
     )
 
 
 def send_startup_msg():
-    basket_str = ', '.join(
-        s.replace('USDT', '') for s in DOMINANCE_BASKET
-    )
     send_msg(
-        f"🤖 <b>SMT Alert Bot — LIVE</b>\n"
-        f"{'─'*32}\n"
-        f"<b>Coins:</b>       {', '.join(COINS)}\n"
-        f"<b>Timeframes:</b>  {', '.join(TIMEFRAMES)}\n"
-        f"<b>Comparison:</b>  Synthetic BTC Dominance (BTC.D)\n\n"
-        f"<b>Data source:</b> Binance.US only\n"
-        f"<b>BTC.D basket:</b> {basket_str}\n\n"
-        f"<b>SMT Logic:</b>\n"
-        f"  🟢 BULL = Coin Lower Low   + BTC.D Higher Low\n"
-        f"  🔴 BEAR = Coin Higher High + BTC.D Lower High\n\n"
-        f"<b>Scan:</b>          Every 5 minutes\n"
-        f"<b>BTC.D refresh:</b> Every 15 minutes\n"
-        f"<b>Alert cooldown:</b> 30 minutes\n\n"
-        f"<i>Building BTC.D cache — first scan starts shortly…</i>"
+        f"🤖 <b>OB Alert Bot — LIVE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Coins:</b> {', '.join(COINS)}\n"
+        f"<b>Timeframes:</b> {', '.join(TIMEFRAMES)}\n\n"
+        f"<b>Mode:</b> Nephew_Sam_ replica\n"
+        f"<b>Fractal:</b> {FRACTAL_TYPE}-bar\n"
+        f"<b>FVG required:</b> {REQUIRE_FVG}\n"
+        f"<b>OB lookback:</b> {OB_SEARCH_LOOKBACK}\n"
+        f"<b>Skip overlap:</b> {SKIP_OVERLAP}\n"
+        f"<b>Fresh only:</b> {FRESH_ONLY}\n\n"
+        f"<b>Alerts:</b>\n"
+        f"  🟡 PRE-ALERT — live candle breaking\n"
+        f"  🟢 CONFIRMED — close confirmed\n\n"
+        f"<b>Scan:</b> Every 1 minute\n"
+        f"<b>Cooldown:</b> 30 min per type\n\n"
+        f"<i>Data: Binance.US</i>"
     )
 
 
@@ -494,81 +507,89 @@ def send_startup_msg():
 # ============================================================
 
 def scan_all():
-    """
-    Main scan function.
-    Waits for BTCD_READY before running — prevents the race
-    condition where scan fires before BTC.D cache is built.
-    """
     try:
-        # Block until BTC.D is ready (max 120s wait)
-        if not BTCD_READY.is_set():
-            logger.info("Scan waiting for BTC.D cache to be ready…")
-            BTCD_READY.wait(timeout=120)
-            if not BTCD_READY.is_set():
-                logger.error(
-                    "BTC.D cache not ready after 120s — skipping scan"
-                )
-                return
-
         now = datetime.now(timezone.utc)
-        logger.info(f"🔍 Scan at {now.strftime('%H:%M:%S UTC')}")
+        logger.info(f"🔍 OB scan at {now.strftime('%H:%M:%S UTC')}")
 
         for coin_name, coin_ticker in COINS.items():
             for tf_label, tf_interval in TIMEFRAMES.items():
 
-                comp_df = get_btcd(tf_label)
-                if comp_df is None:
-                    logger.warning(
-                        f"BTC.D {tf_label} missing — skipping {coin_name}"
-                    )
-                    continue
-
-                coin_df = fetch_klines(
+                df = fetch_klines(
                     coin_ticker,
                     BINANCE_INTERVAL[tf_interval],
                     limit=500,
                 )
-                if coin_df is None:
-                    logger.warning(
-                        f"No Binance data: {coin_name} {tf_label}"
-                    )
+                if df is None or len(df) < 50:
+                    logger.warning(f"No data: {coin_name} {tf_label}")
                     continue
 
-                for sig in detect_smt(coin_df, comp_df, COMP_LABEL):
-                    sig_key = (
-                        f"{coin_name}_{tf_label}_{sig['direction']}_"
-                        f"{sig['coin_bar_a']}_{sig['coin_bar_b']}_"
-                        f"{round(sig['coin_px_a'], 4)}_"
-                        f"{round(sig['coin_px_b'], 4)}"
-                    )
-                    if sig_key in sent_signatures:
-                        continue
+                confirmed_obs, prealert_obs = detect_obs(df, include_live=True)
 
-                    ck = (f"{coin_name}_{tf_label}_"
-                          f"{sig['direction']}_BTCD")
+                # ── Send CONFIRMED alerts ──────────────────
+                count_confirmed = 0
+                # Sort newest first, limit to MAX_OBS_PER_COIN
+                confirmed_obs.sort(key=lambda o: o['break_idx'], reverse=True)
+                for ob in confirmed_obs[:MAX_OBS_PER_COIN]:
+                    sig = (
+                        f"CONF_{coin_name}_{tf_label}_{ob['type']}_"
+                        f"{pd.Timestamp(ob['ob_time']).isoformat()}_"
+                        f"{pd.Timestamp(ob['break_time']).isoformat()}"
+                    )
+                    if sig in sent_signatures:
+                        continue
+                    ck = f"{coin_name}_{tf_label}_{ob['type']}"
                     if (time.time() - last_alerts.get(ck, 0)
                             < COOLDOWN_SECONDS):
                         continue
-
-                    send_msg(format_signal(coin_name, tf_label, sig))
-                    sent_signatures.add(sig_key)
+                    send_msg(fmt_compact(coin_name, tf_label, ob))
+                    sent_signatures.add(sig)
                     last_alerts[ck] = time.time()
+                    count_confirmed += 1
                     logger.info(
-                        f"✅ {sig['direction']} SMT {coin_name} "
-                        f"{tf_label} | "
-                        f"coin={sig['coin_px_b']:.4f} "
-                        f"btcd={sig['comp_px_b']:.3f}%"
+                        f"✅ CONFIRMED {ob['type']} OB {coin_name} {tf_label} | "
+                        f"zone[{ob['bot_level']:.4f}–{ob['top_level']:.4f}]"
+                    )
+
+                # ── Send PRE-ALERTS (max 1 per live candle) ─
+                count_prealert = 0
+                # Pre-alerts are deduped per LIVE candle
+                live_candle_time = df['time'].iloc[-1]
+                for ob in prealert_obs[:MAX_OBS_PER_COIN]:
+                    sig = (
+                        f"PRE_{coin_name}_{tf_label}_{ob['type']}_"
+                        f"{pd.Timestamp(live_candle_time).isoformat()}"
+                    )
+                    if sig in prealert_signatures:
+                        continue
+                    send_msg(fmt_compact(coin_name, tf_label, ob))
+                    prealert_signatures.add(sig)
+                    count_prealert += 1
+                    logger.info(
+                        f"⚠️ PRE-ALERT {ob['type']} OB {coin_name} {tf_label} | "
+                        f"live close={ob['live_close']:.4f} | "
+                        f"zone[{ob['bot_level']:.4f}–{ob['top_level']:.4f}]"
+                    )
+
+                if count_confirmed or count_prealert:
+                    logger.info(
+                        f"   → {coin_name} {tf_label}: "
+                        f"{count_confirmed} confirmed, {count_prealert} pre-alerts"
                     )
 
                 time.sleep(0.2)
 
-        if len(sent_signatures) > 2000:
-            for s in list(sent_signatures)[:1000]:
+        # Trim memory
+        if len(sent_signatures) > 5000:
+            for s in list(sent_signatures)[:2500]:
                 sent_signatures.discard(s)
+        if len(prealert_signatures) > 5000:
+            for s in list(prealert_signatures)[:2500]:
+                prealert_signatures.discard(s)
 
         logger.info(
             f"✅ Scan complete — "
-            f"{len(sent_signatures)} signals sent so far"
+            f"{len(sent_signatures)} confirmed | "
+            f"{len(prealert_signatures)} pre-alerts (lifetime)"
         )
 
     except Exception as e:
@@ -581,46 +602,30 @@ def scan_all():
 
 @app.route('/')
 def index():
-    now  = datetime.now(timezone.utc)
-    rows = ''
-    for tf in TIMEFRAMES:
-        df  = get_btcd(tf)
-        age = int(time.time() - BTCD_CACHE_TS.get(tf, 0))
-        if df is not None:
-            rows += (
-                f"<li><b>{tf}</b>: {len(df)} candles | "
-                f"latest BTC.D = {df['close'].iloc[-1]:.3f}% | "
-                f"cache age = {age}s</li>"
-            )
-        else:
-            rows += (
-                f"<li><b>{tf}</b>: "
-                f"building… (first load ~30s)</li>"
-            )
-    ready_str  = '✅ Ready' if BTCD_READY.is_set() else '⏳ Building…'
+    now = datetime.now(timezone.utc)
     coins_html = ''.join(f"<li>{c}/USDT</li>" for c in COINS)
-    basket_html = ''.join(
-        f"<li>{s.replace('USDT', '')}</li>"
-        for s in DOMINANCE_BASKET
-    )
+    tfs_html   = ''.join(f"<li>{tf}</li>" for tf in TIMEFRAMES)
     return (
-        f"<h2>🤖 SMT Alert Bot</h2>"
+        f"<h2>🤖 Order Block Alert Bot</h2>"
         f"<p><b>Status:</b> ✅ Running</p>"
-        f"<p><b>BTC.D Cache:</b> {ready_str}</p>"
         f"<p><b>Time UTC:</b> {now.strftime('%Y-%m-%d %H:%M:%S')}</p>"
-        f"<p><b>Data source:</b> Binance.US only</p>"
-        f"<p><b>Scan:</b> every 5 min | "
-        f"<b>BTC.D refresh:</b> every 15 min</p>"
-        f"<p><b>Total alerts sent:</b> {len(sent_signatures)}</p>"
+        f"<p><b>Mode:</b> Nephew_Sam_ replica + close confirm</p>"
+        f"<p><b>Data source:</b> Binance.US</p>"
+        f"<p><b>Scan interval:</b> 1 minute</p>"
+        f"<p><b>Settings:</b> {FRACTAL_TYPE}-bar fractal | "
+        f"FVG: {REQUIRE_FVG} | "
+        f"Lookback: {OB_SEARCH_LOOKBACK} | "
+        f"Overlap skip: {SKIP_OVERLAP} | "
+        f"Fresh only: {FRESH_ONLY}</p>"
+        f"<p><b>Confirmed alerts sent:</b> {len(sent_signatures)}</p>"
+        f"<p><b>Pre-alerts sent:</b> {len(prealert_signatures)}</p>"
         f"<p><b>Active cooldowns:</b> {len(last_alerts)}</p>"
         f"<h3>Monitoring:</h3><ul>{coins_html}</ul>"
-        f"<h3>BTC.D Cache:</h3><ul>{rows}</ul>"
-        f"<h3>Dominance Basket:</h3><ul>{basket_html}</ul>"
+        f"<h3>Timeframes:</h3><ul>{tfs_html}</ul>"
         f"<p>"
-        f"<a href='/btcd'>View BTC.D candles</a> | "
         f"<a href='/scan_now'>Force scan</a> | "
-        f"<a href='/refresh_btcd'>Force BTC.D refresh</a> | "
-        f"<a href='/status'>JSON status</a>"
+        f"<a href='/status'>JSON status</a> | "
+        f"<a href='/reset'>Reset state</a>"
         f"</p>"
     )
 
@@ -632,66 +637,39 @@ def health():
 
 @app.route('/status')
 def status():
-    info = {}
-    for tf in TIMEFRAMES:
-        df = get_btcd(tf)
-        info[tf] = {
-            'candles': len(df) if df is not None else 0,
-            'latest':  float(df['close'].iloc[-1]) if df is not None else None,
-            'age_sec': int(time.time() - BTCD_CACHE_TS.get(tf, 0)),
-        }
     return {
-        'status':      'running',
-        'btcd_ready':  BTCD_READY.is_set(),
-        'time_utc':    datetime.now(timezone.utc).isoformat(),
-        'alerts_sent': len(sent_signatures),
-        'cooldowns':   len(last_alerts),
-        'btcd_cache':  info,
-        'basket_size': len(DOMINANCE_BASKET),
+        'status':            'running',
+        'mode':              'Nephew_Sam_ replica + close confirm',
+        'time_utc':          datetime.now(timezone.utc).isoformat(),
+        'coins':             list(COINS.keys()),
+        'timeframes':        list(TIMEFRAMES.keys()),
+        'confirmed_sent':    len(sent_signatures),
+        'prealerts_sent':    len(prealert_signatures),
+        'cooldowns':         len(last_alerts),
+        'settings': {
+            'fractal_type':         FRACTAL_TYPE,
+            'require_fvg':          REQUIRE_FVG,
+            'max_ob_to_fvg_bars':   MAX_OB_TO_FVG_BARS,
+            'ob_search_lookback':   OB_SEARCH_LOOKBACK,
+            'skip_overlap':         SKIP_OVERLAP,
+            'overlap_window':       OVERLAP_WINDOW,
+            'fresh_only':           FRESH_ONLY,
+            'max_obs_per_coin':     MAX_OBS_PER_COIN,
+        },
     }
-
-
-@app.route('/btcd')
-def show_btcd():
-    out = []
-    for tf in TIMEFRAMES:
-        df = get_btcd(tf)
-        if df is not None:
-            out.append(
-                f"<h3>Synthetic BTC.D — {tf} "
-                f"(last 10 candles)</h3>"
-                f"<pre>{df.tail(10).to_string(index=False)}</pre>"
-            )
-        else:
-            out.append(
-                f"<h3>BTC.D {tf}</h3>"
-                f"<p>Not loaded yet — check back in 30s.</p>"
-            )
-    return ''.join(out) or '<p>No BTC.D data yet.</p>'
 
 
 @app.route('/scan_now')
 def scan_now_route():
     threading.Thread(target=scan_all, daemon=True).start()
-    return 'Scan triggered! Check logs.', 200
-
-
-@app.route('/refresh_btcd')
-def refresh_btcd_route():
-    threading.Thread(
-        target=refresh_btcd_cache, daemon=True
-    ).start()
-    return 'BTC.D refresh triggered! Check /btcd in ~30s.', 200
+    return 'OB scan triggered! Check logs.', 200
 
 
 @app.route('/reset')
 def reset():
     sent_signatures.clear()
+    prealert_signatures.clear()
     last_alerts.clear()
-    BTCD_READY.clear()
-    with BTCD_LOCK:
-        BTCD_CACHE.clear()
-        BTCD_CACHE_TS.clear()
     return 'Reset done — all state cleared.', 200
 
 
@@ -700,47 +678,28 @@ def reset():
 # ============================================================
 
 def start_bot():
-    logger.info("SMT Bot starting — synthetic BTC.D / Binance.US only")
+    logger.info("Order Block Bot starting…")
 
     try:
         send_startup_msg()
     except Exception as e:
         logger.error(f"Startup msg error: {e}")
 
-    # Build BTC.D cache first — scan won't run until this completes
-    threading.Thread(
-        target=refresh_btcd_cache, daemon=True
-    ).start()
-
     scheduler = BackgroundScheduler(timezone='UTC')
-
-    # Scan every 5 minutes — sufficient for 15m and 1H candles
     scheduler.add_job(
         scan_all,
         trigger='cron',
-        minute='0,5,10,15,20,25,30,35,40,45,50,55',
-        id='scan_job',
+        minute='*',                 # Every 1 minute
+        id='ob_scan_job',
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=30,
+        misfire_grace_time=20,
     )
-
-    # Refresh BTC.D every 15 minutes
-    scheduler.add_job(
-        refresh_btcd_cache,
-        trigger='cron',
-        minute='0,15,30,45',
-        id='btcd_refresh_job',
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=60,
-    )
-
     scheduler.start()
-    logger.info(
-        "Scheduler started — "
-        "scan every 5 min | BTC.D refresh every 15 min"
-    )
+    logger.info("Scheduler started — OB scan every 1 minute")
+
+    # Initial scan
+    threading.Thread(target=scan_all, daemon=True).start()
 
 
 threading.Thread(target=start_bot, daemon=True).start()
